@@ -3,7 +3,6 @@
 import json
 from unittest.mock import MagicMock
 
-import pytest
 from dagster import RunRequest, SensorResult, SkipReason, build_sensor_context, sensor
 from dagster._core.definitions.job_definition import JobDefinition
 
@@ -450,37 +449,45 @@ class TestMultipleRunRequests:
 
 
 class TestSensorResult:
-    @pytest.mark.xfail(
-        reason="SensorResult gets unpacked when yielded through the decorator's "
-        "generator. Needs dedicated handling in the decorator.",
-        strict=True,
-    )
-    def test_sensor_result_passed_through(self):
-        """SensorResult (non-generator return) should be forwarded correctly."""
+    def test_sensor_result_run_requests_extracted(self):
+        """SensorResult components are extracted and yielded individually."""
 
         @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
         def result_sensor(context):
             return SensorResult(
-                run_requests=[RunRequest(run_key="sr-1")],
+                run_requests=[RunRequest(run_key="sr-1"), RunRequest(run_key="sr-2")],
                 cursor="new_cursor",
             )
 
         results, cursor = _invoke_sensor(result_sensor)
+        assert len(results) == 2
+        assert all(isinstance(r, RunRequest) for r in results)
+        assert results[0].run_key == "sr-1"
+        assert results[1].run_key == "sr-2"
+
+        guard_state, user_cursor = parse_cursor(cursor)
+        assert guard_state.error_count == 0
+        assert user_cursor == "new_cursor"
+
+    def test_sensor_result_skip_reason_extracted(self):
+        """SensorResult with only a skip_reason yields the SkipReason."""
+
+        @resilient_sensor(threshold=3)
+        @sensor(job=_make_job())
+        def result_sensor(context):
+            return SensorResult(skip_reason=SkipReason("nothing to do"))
+
+        results, cursor = _invoke_sensor(result_sensor)
         assert len(results) == 1
-        assert isinstance(results[0], SensorResult)
-        assert len(results[0].run_requests) == 1
+        assert isinstance(results[0], SkipReason)
+        assert results[0].skip_message == "nothing to do"
 
         guard_state, _ = parse_cursor(cursor)
         assert guard_state.error_count == 0
 
-    @pytest.mark.xfail(
-        reason="SensorResult gets unpacked when yielded through the decorator's "
-        "generator. Needs dedicated handling in the decorator.",
-        strict=True,
-    )
     def test_sensor_result_error_suppressed(self):
-        """Error after returning SensorResult on a previous tick should be suppressed."""
+        """Error after a SensorResult tick should be suppressed."""
         tick = 0
 
         @resilient_sensor(threshold=3)
@@ -495,7 +502,7 @@ class TestSensorResult:
         # Tick 1: SensorResult success.
         results, cursor = _invoke_sensor(result_sensor)
         assert len(results) == 1
-        assert isinstance(results[0], SensorResult)
+        assert isinstance(results[0], RunRequest)
 
         # Tick 2: error suppressed.
         context = build_sensor_context(cursor=cursor)

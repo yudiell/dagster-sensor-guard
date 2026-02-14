@@ -98,6 +98,17 @@ def resilient_sensor(
                         if isinstance(item, RunRequest):
                             has_run_request = True
                         yield item
+                elif isinstance(result, SensorResult):
+                    # SensorResult is a NamedTuple — yielding it raw would
+                    # unpack its fields. Extract components instead.
+                    if result.run_requests:
+                        for rr in result.run_requests:
+                            has_run_request = True
+                            yield rr
+                    if result.skip_reason:
+                        yield result.skip_reason
+                    if result.cursor is not None:
+                        context.update_cursor(result.cursor)
                 elif isinstance(result, (list, tuple)):
                     for item in result:
                         if isinstance(item, RunRequest):
