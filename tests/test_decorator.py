@@ -238,6 +238,50 @@ class TestCallback:
         assert callback.call_count == 1  # unchanged
 
 
+class TestSensorIsolation:
+    def test_error_counts_are_independent_across_sensors(self):
+        """Each decorated sensor tracks its own error count via its own cursor."""
+
+        @resilient_sensor(threshold=3)
+        @sensor(job=_make_job(), name="sensor_a")
+        def sensor_a(context):
+            raise ConnectionError("sensor A down")
+
+        @resilient_sensor(threshold=3)
+        @sensor(job=_make_job(), name="sensor_b")
+        def sensor_b(context):
+            raise ConnectionError("sensor B down")
+
+        cursor_a = None
+        cursor_b = None
+
+        # Fail sensor_a 3 times.
+        for _ in range(3):
+            ctx = build_sensor_context(cursor=cursor_a)
+            list(sensor_a(ctx))
+            cursor_a = ctx._cursor  # noqa: SLF001
+
+        # sensor_a is at 3 errors.
+        guard_a, _ = parse_cursor(cursor_a)
+        assert guard_a.error_count == 3
+
+        # sensor_b should still be at 0 — never ticked.
+        guard_b, _ = parse_cursor(cursor_b)
+        assert guard_b.error_count == 0
+
+        # Fail sensor_b once.
+        ctx = build_sensor_context(cursor=cursor_b)
+        list(sensor_b(ctx))
+        cursor_b = ctx._cursor  # noqa: SLF001
+
+        guard_b, _ = parse_cursor(cursor_b)
+        assert guard_b.error_count == 1
+
+        # sensor_a is still at 3 — unaffected by sensor_b.
+        guard_a, _ = parse_cursor(cursor_a)
+        assert guard_a.error_count == 3
+
+
 class TestMultipleRunRequests:
     def test_run_requests_forwarded_then_error_suppressed_no_skip(self):
         """If RunRequests were yielded before the error, suppress without SkipReason."""
