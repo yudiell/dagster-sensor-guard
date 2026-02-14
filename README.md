@@ -16,8 +16,8 @@ All parameters are optional. The simplest usage with sensible defaults:
 from dagster import sensor, RunRequest, SkipReason
 from dagster_sensor_guard import resilient_sensor
 
-@resilient_sensor()
 @sensor(job=my_job, minimum_interval_seconds=60)
+@resilient_sensor()
 def my_sensor(context):
     new_files = check_for_new_files()
     if new_files:
@@ -52,8 +52,8 @@ When `window_minutes` is not set, consecutive errors accumulate regardless of ho
 ```python
 # Sensor runs every 5 minutes.
 # After 3 consecutive failures (could span 15 minutes), the 4th raises.
-@resilient_sensor(threshold=3)
 @sensor(job=my_job, minimum_interval_seconds=300)
+@resilient_sensor(threshold=3)
 def my_sensor(context):
     ...
 ```
@@ -71,11 +71,11 @@ Formula: `window_minutes > (threshold + 1) * (minimum_interval_seconds / 60)`
 # 10 min / 2 min = 5 ticks fit in the window — enough to hit threshold+1 (4).
 # If 3 consecutive errors happen within 10 minutes, the 4th raises.
 # If errors are spread over more than 10 minutes, the counter resets.
+@sensor(job=my_job, minimum_interval_seconds=120)
 @resilient_sensor(
     threshold=3,
     window_minutes=10,
 )
-@sensor(job=my_job, minimum_interval_seconds=120)
 def my_sensor(context):
     ...
 ```
@@ -85,11 +85,11 @@ def my_sensor(context):
 # 10 min / 5 min = only 2 ticks fit in the window.
 # You need 4 ticks (threshold+1) to raise, but only 2 fit.
 # The threshold can NEVER be reached. Don't do this.
+@sensor(job=my_job, minimum_interval_seconds=300)
 @resilient_sensor(
     threshold=3,
     window_minutes=10,  # too small!
 )
-@sensor(job=my_job, minimum_interval_seconds=300)
 ```
 
 ## Choosing the right reset strategy
@@ -99,8 +99,8 @@ def my_sensor(context):
 One successful tick clears the error count entirely. Simple and predictable.
 
 ```python
-@resilient_sensor(threshold=3)
 @sensor(job=my_job)
+@resilient_sensor(threshold=3)
 def my_sensor(context):
     ...
 ```
@@ -112,12 +112,12 @@ Each success decrements the count by `decay_amount` instead of clearing it. Usef
 ```python
 # Error count is 3, one success brings it to 1 (not 0).
 # The service must succeed 2 more times to fully clear the count.
+@sensor(job=my_job)
 @resilient_sensor(
     threshold=5,
     reset_strategy="decay",
     decay_amount=2,
 )
-@sensor(job=my_job)
 def my_sensor(context):
     ...
 ```
@@ -128,8 +128,8 @@ def my_sensor(context):
 def log_suppressed(error, count, threshold):
     logger.warning(f"Sensor error suppressed ({count}/{threshold}): {error}")
 
-@resilient_sensor(threshold=3, on_suppressed_error=log_suppressed)
 @sensor(job=my_job)
+@resilient_sensor(threshold=3, on_suppressed_error=log_suppressed)
 def my_sensor(context):
     ...
 ```
@@ -141,8 +141,8 @@ The callback is invoked each time an error is suppressed (not when the threshold
 The decorator transparently namespaces its state in the sensor cursor. Your existing cursor logic works without modification:
 
 ```python
-@resilient_sensor()
 @sensor(job=my_job)
+@resilient_sensor()
 def my_sensor(context):
     offset = int(context.cursor or "0")
     # ... process from offset ...

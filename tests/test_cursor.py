@@ -24,8 +24,8 @@ def _make_job():
 
 class TestCursorIsolation:
     def test_user_cursor_preserved_through_success(self):
-        @resilient_sensor(threshold=5)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5)
         def cursor_sensor(context):
             current = context.cursor or "0"
             new_val = str(int(current) + 1)
@@ -45,8 +45,8 @@ class TestCursorIsolation:
     def test_user_cursor_preserved_through_errors(self):
         tick = 0
 
-        @resilient_sensor(threshold=5)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5)
         def cursor_sensor(context):
             nonlocal tick
             tick += 1
@@ -75,8 +75,8 @@ class TestCursorIsolation:
         assert guard_state.error_count == 1
 
     def test_sensor_with_no_cursor_usage(self):
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
         def simple_sensor(context):
             yield SkipReason("Nothing to do")
 
@@ -92,8 +92,8 @@ class TestCursorIsolation:
         """User should see their own cursor value, not the raw JSON with guard state."""
         observed_cursors = []
 
-        @resilient_sensor(threshold=5)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5)
         def cursor_sensor(context):
             observed_cursors.append(context.cursor)
             context.update_cursor("my_value")
@@ -114,8 +114,8 @@ class TestCursorIsolation:
     def test_user_cursor_json_preserved(self):
         """User cursors that are themselves JSON should roundtrip correctly."""
 
-        @resilient_sensor(threshold=5)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5)
         def json_cursor_sensor(context):
             if context.cursor:
                 data = json.loads(context.cursor)

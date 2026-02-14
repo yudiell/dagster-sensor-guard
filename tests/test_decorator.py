@@ -37,8 +37,8 @@ def _invoke_sensor(sensor_def, cursor=None):
 
 class TestCountThreshold:
     def test_errors_below_threshold_are_suppressed(self):
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
@@ -53,8 +53,8 @@ class TestCountThreshold:
             assert f"({i + 1}/3)" in results[0].skip_message
 
     def test_error_at_threshold_plus_one_raises(self):
-        @resilient_sensor(threshold=2)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=2)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
@@ -74,8 +74,8 @@ class TestCountThreshold:
             pass
 
     def test_error_on_first_tick(self):
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
         def failing_sensor(context):
             raise RuntimeError("boom")
 
@@ -87,8 +87,8 @@ class TestCountThreshold:
 
 class TestTimeWindowThreshold:
     def test_errors_within_window_accumulate(self):
-        @resilient_sensor(threshold=2, window_minutes=10)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=2, window_minutes=10)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
@@ -107,8 +107,8 @@ class TestTimeWindowThreshold:
             pass
 
     def test_errors_outside_window_reset_counter(self):
-        @resilient_sensor(threshold=2, window_minutes=10)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=2, window_minutes=10)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
@@ -136,8 +136,8 @@ class TestFullReset:
     def test_success_clears_error_count(self):
         tick = 0
 
-        @resilient_sensor(threshold=5)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5)
         def flapping_sensor(context):
             nonlocal tick
             tick += 1
@@ -170,8 +170,8 @@ class TestDecayReset:
     def test_success_decrements_by_decay_amount(self):
         tick = 0
 
-        @resilient_sensor(threshold=5, reset_strategy="decay", decay_amount=2)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5, reset_strategy="decay", decay_amount=2)
         def flapping_sensor(context):
             nonlocal tick
             tick += 1
@@ -208,8 +208,8 @@ class TestDecayReset:
         script = [False, True, False, False, True]
         tick = 0
 
-        @resilient_sensor(threshold=5, reset_strategy="decay", decay_amount=1)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5, reset_strategy="decay", decay_amount=1)
         def flapping_sensor(context):
             nonlocal tick
             idx = tick
@@ -243,8 +243,8 @@ class TestRecoveryAfterBreach:
         script = [False, False, False, False, True]
         tick = 0
 
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
         def recovering_sensor(context):
             nonlocal tick
             idx = tick
@@ -289,8 +289,8 @@ class TestRecoveryAfterBreach:
         script = [False, False, False, False, True, False]
         tick = 0
 
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
         def recovering_sensor(context):
             nonlocal tick
             idx = tick
@@ -334,8 +334,8 @@ class TestCallback:
     def test_on_suppressed_error_called(self):
         callback = MagicMock()
 
-        @resilient_sensor(threshold=3, on_suppressed_error=callback)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3, on_suppressed_error=callback)
         def failing_sensor(context):
             raise ValueError("bad value")
 
@@ -350,8 +350,8 @@ class TestCallback:
     def test_callback_not_called_when_threshold_breached(self):
         callback = MagicMock()
 
-        @resilient_sensor(threshold=1, on_suppressed_error=callback)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=1, on_suppressed_error=callback)
         def failing_sensor(context):
             raise ValueError("bad value")
 
@@ -374,13 +374,13 @@ class TestSensorIsolation:
     def test_error_counts_are_independent_across_sensors(self):
         """Each decorated sensor tracks its own error count via its own cursor."""
 
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job(), name="sensor_a")
+        @resilient_sensor(threshold=3)
         def sensor_a(context):
             raise ConnectionError("sensor A down")
 
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job(), name="sensor_b")
+        @resilient_sensor(threshold=3)
         def sensor_b(context):
             raise ConnectionError("sensor B down")
 
@@ -418,8 +418,8 @@ class TestMultipleRunRequests:
     def test_run_requests_forwarded_then_error_suppressed_no_skip(self):
         """If RunRequests were yielded before the error, suppress without SkipReason."""
 
-        @resilient_sensor(threshold=5)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5)
         def partial_sensor(context):
             yield RunRequest(run_key="a")
             yield RunRequest(run_key="b")
@@ -436,8 +436,8 @@ class TestMultipleRunRequests:
         assert guard_state.error_count == 1
 
     def test_multiple_run_requests_success(self):
-        @resilient_sensor(threshold=5)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5)
         def multi_sensor(context):
             yield RunRequest(run_key="a")
             yield RunRequest(run_key="b")
@@ -452,8 +452,8 @@ class TestSensorResult:
     def test_sensor_result_run_requests_extracted(self):
         """SensorResult components are extracted and yielded individually."""
 
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
         def result_sensor(context):
             return SensorResult(
                 run_requests=[RunRequest(run_key="sr-1"), RunRequest(run_key="sr-2")],
@@ -473,8 +473,8 @@ class TestSensorResult:
     def test_sensor_result_skip_reason_extracted(self):
         """SensorResult with only a skip_reason yields the SkipReason."""
 
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
         def result_sensor(context):
             return SensorResult(skip_reason=SkipReason("nothing to do"))
 
@@ -490,8 +490,8 @@ class TestSensorResult:
         """Error after a SensorResult tick should be suppressed."""
         tick = 0
 
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
         def result_sensor(context):
             nonlocal tick
             tick += 1
@@ -516,8 +516,8 @@ class TestNoneReturn:
     def test_sensor_returning_none(self):
         """A sensor that returns None (no yield, no return) should succeed cleanly."""
 
-        @resilient_sensor(threshold=3)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
         def none_sensor(context):
             pass  # returns None implicitly
 
@@ -531,8 +531,8 @@ class TestNoneReturn:
         """A None-returning success should still reset the error counter."""
         tick = 0
 
-        @resilient_sensor(threshold=5)
         @sensor(job=_make_job())
+        @resilient_sensor(threshold=5)
         def none_sensor(context):
             nonlocal tick
             tick += 1

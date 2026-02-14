@@ -2,9 +2,8 @@
 
 Implementation notes (from Dagster source investigation):
 
-- @sensor(job=...) returns a SensorDefinition. Our decorator sits above it and
-  receives that SensorDefinition. We extract _raw_fn + config, wrap the raw fn,
-  and construct a new SensorDefinition.
+- @resilient_sensor wraps the raw sensor function BEFORE @sensor processes it.
+  @sensor then receives the wrapped function and builds the SensorDefinition.
 
 - context.cursor is Optional[str] — None when unset.
   context.update_cursor() accepts Optional[str].
@@ -27,8 +26,7 @@ import inspect
 from functools import update_wrapper
 from typing import Callable, Optional, Union
 
-from dagster import SensorDefinition, SkipReason
-from dagster._core.definitions.run_request import RunRequest, SensorResult
+from dagster import RunRequest, SensorDefinition, SensorResult, SkipReason
 from dagster._core.definitions.sensor_definition import SensorEvaluationContext
 
 from dagster_sensor_guard.state import (
@@ -48,14 +46,14 @@ def resilient_sensor(
     reset_strategy: Union[str, ResetStrategy] = ResetStrategy.FULL,
     decay_amount: int = 1,
     on_suppressed_error: Optional[Callable[[Exception, int, int], None]] = None,
-) -> Callable[[SensorDefinition], SensorDefinition]:
+) -> Callable:
     """Decorator that adds error tolerance to a Dagster sensor.
 
-    Wraps a sensor so that transient errors are suppressed until a consecutive
-    failure threshold is breached. Must be stacked above @sensor:
+    Wraps the raw sensor function with error tracking. Must be stacked
+    below @sensor:
 
-        @resilient_sensor(threshold=3)
         @sensor(job=my_job)
+        @resilient_sensor(threshold=3)
         def my_sensor(context):
             ...
 
@@ -76,12 +74,19 @@ def resilient_sensor(
     """
     reset_enum = ResetStrategy(reset_strategy)
 
-    def decorator(sensor_def: SensorDefinition) -> SensorDefinition:
-        original_fn = sensor_def._raw_fn  # noqa: SLF001
+    def decorator(fn: Callable) -> Callable:
+        if isinstance(fn, SensorDefinition):
+            raise TypeError(
+                "@resilient_sensor must be applied below @sensor, not above it.\n"
+                "Correct usage:\n"
+                "    @sensor(job=my_job)\n"
+                "    @resilient_sensor(threshold=3)\n"
+                "    def my_sensor(context): ..."
+            )
 
         def wrapped_fn(context: SensorEvaluationContext):
             # --- Cursor setup: extract guard state, expose user cursor ---
-            raw_cursor = context._cursor  # noqa: SLF001
+            raw_cursor = context.cursor
             guard_state, user_cursor = parse_cursor(raw_cursor)
 
             # Expose only the user's cursor to the sensor function.
@@ -91,7 +96,7 @@ def resilient_sensor(
             has_run_request = False
 
             try:
-                result = original_fn(context)
+                result = fn(context)
 
                 if inspect.isgenerator(result):
                     for item in result:
@@ -161,26 +166,8 @@ def resilient_sensor(
             context.update_cursor(build_cursor(guard_state, updated_user_cursor))
 
         # Preserve function metadata for Dagster introspection.
-        update_wrapper(wrapped_fn, original_fn)
-
-        # Build a new SensorDefinition with the wrapped evaluation function.
-        new_sensor = SensorDefinition.dagster_internal_init(
-            name=sensor_def.name,
-            evaluation_fn=wrapped_fn,
-            minimum_interval_seconds=sensor_def.minimum_interval_seconds,
-            description=sensor_def.description,
-            job_name=None,
-            job=None,
-            jobs=sensor_def.jobs if sensor_def.has_jobs else None,
-            default_status=sensor_def.default_status,
-            asset_selection=sensor_def.asset_selection,
-            required_resource_keys=sensor_def._raw_required_resource_keys,  # noqa: SLF001
-            tags=sensor_def.tags,
-            metadata=dict(sensor_def.metadata),
-            target=None,
-            owners=sensor_def.owners,
-        )
-        return new_sensor
+        update_wrapper(wrapped_fn, fn)
+        return wrapped_fn
 
     return decorator
 
@@ -193,6 +180,6 @@ def _read_user_cursor(
     If the user called update_cursor(), use whatever they set.
     Otherwise, fall back to what we injected before the call.
     """
-    if context._cursor_updated:  # noqa: SLF001
-        return context._cursor  # noqa: SLF001
+    if context.cursor_updated:
+        return context.cursor
     return original_user_cursor
