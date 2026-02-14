@@ -34,7 +34,7 @@ class TestParseCursor:
 
     def test_valid_guard_cursor(self):
         raw = json.dumps({
-            "__sensor_guard": {"error_count": 3, "first_error_ts": 1000.0, "last_error_ts": 1010.0},
+            "__dagster_sensor_guard_v1": {"error_count": 3, "first_error_ts": 1000.0, "last_error_ts": 1010.0},
             "__user_cursor": "user_data",
         })
         state, user_cursor = parse_cursor(raw)
@@ -45,7 +45,7 @@ class TestParseCursor:
 
     def test_guard_cursor_with_none_user(self):
         raw = json.dumps({
-            "__sensor_guard": {"error_count": 1},
+            "__dagster_sensor_guard_v1": {"error_count": 1},
             "__user_cursor": None,
         })
         state, user_cursor = parse_cursor(raw)
@@ -118,25 +118,32 @@ class TestApplyReset:
 class TestShouldRaise:
     def test_count_below_threshold(self):
         state = GuardState(error_count=3)
-        assert not should_raise(state, threshold=5, window_minutes=None)
+        assert not should_raise(state, threshold=5)
 
     def test_count_at_threshold(self):
         state = GuardState(error_count=5)
-        assert not should_raise(state, threshold=5, window_minutes=None)
+        assert not should_raise(state, threshold=5)
 
     def test_count_above_threshold(self):
         state = GuardState(error_count=6)
-        assert should_raise(state, threshold=5, window_minutes=None)
+        assert should_raise(state, threshold=5)
 
-    def test_time_window_within_window_above_threshold(self):
-        now = time.time()
-        state = GuardState(error_count=6, first_error_ts=now - 60)
-        assert should_raise(state, threshold=5, window_minutes=10)
 
-    def test_time_window_outside_window(self):
+class TestIncrementErrorWithWindow:
+    def test_window_resets_expired_chain(self):
         now = time.time()
-        state = GuardState(error_count=6, first_error_ts=now - 700)
+        state = GuardState(error_count=5, first_error_ts=now - 700, last_error_ts=now - 60)
         with patch("dagster_sensor_guard.state.time") as mock_time:
             mock_time.time.return_value = now
-            result = should_raise(state, threshold=5, window_minutes=10)
-        assert not result
+            new_state = increment_error(state, window_minutes=10)
+        # Chain expired — should reset to count 1 (fresh chain).
+        assert new_state.error_count == 1
+
+    def test_window_preserves_active_chain(self):
+        now = time.time()
+        state = GuardState(error_count=5, first_error_ts=now - 60, last_error_ts=now - 10)
+        with patch("dagster_sensor_guard.state.time") as mock_time:
+            mock_time.time.return_value = now
+            new_state = increment_error(state, window_minutes=10)
+        # Chain still active — should increment normally.
+        assert new_state.error_count == 6

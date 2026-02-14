@@ -1,28 +1,24 @@
 """Tests for the @resilient_sensor decorator."""
 
 import json
+import logging
 from unittest.mock import MagicMock
 
-from dagster import RunRequest, SensorResult, SkipReason, build_sensor_context, sensor
-from dagster._core.definitions.job_definition import JobDefinition
+import pytest
+from dagster import (
+    AddDynamicPartitionsRequest,
+    AssetKey,
+    AssetMaterialization,
+    RunRequest,
+    SensorResult,
+    SkipReason,
+    build_sensor_context,
+    sensor,
+)
 
 from dagster_sensor_guard import resilient_sensor
-from dagster_sensor_guard.state import parse_cursor
-
-
-def _make_job() -> JobDefinition:
-    """Create a no-op job for sensor targets."""
-    from dagster import job, op
-
-    @op
-    def noop():
-        pass
-
-    @job
-    def noop_job():
-        noop()
-
-    return noop_job
+from dagster_sensor_guard.state import _GUARD_KEY, parse_cursor
+from tests.conftest import make_job as _make_job
 
 
 def _invoke_sensor(sensor_def, cursor=None):
@@ -121,7 +117,7 @@ class TestTimeWindowThreshold:
 
         # Manipulate the cursor to make first_error_ts old (outside window).
         data = json.loads(cursor)
-        data["__sensor_guard"]["first_error_ts"] = 1000.0  # very old
+        data[_GUARD_KEY]["first_error_ts"] = 1000.0  # very old
         cursor = json.dumps(data)
 
         # Next error should be suppressed (counter reset due to window expiry).
@@ -449,8 +445,8 @@ class TestMultipleRunRequests:
 
 
 class TestSensorResult:
-    def test_sensor_result_run_requests_extracted(self):
-        """SensorResult components are extracted and yielded individually."""
+    def test_sensor_result_yielded_with_contents(self):
+        """SensorResult is yielded as-is (with cursor stripped) for Dagster to process."""
 
         @sensor(job=_make_job())
         @resilient_sensor(threshold=3)
@@ -461,17 +457,19 @@ class TestSensorResult:
             )
 
         results, cursor = _invoke_sensor(result_sensor)
-        assert len(results) == 2
-        assert all(isinstance(r, RunRequest) for r in results)
-        assert results[0].run_key == "sr-1"
-        assert results[1].run_key == "sr-2"
+        assert len(results) == 1
+        assert isinstance(results[0], SensorResult)
+        assert len(results[0].run_requests) == 2
+        assert results[0].run_requests[0].run_key == "sr-1"
+        assert results[0].run_requests[1].run_key == "sr-2"
+        assert results[0].cursor is None  # cursor stripped, handled via namespacing
 
         guard_state, user_cursor = parse_cursor(cursor)
         assert guard_state.error_count == 0
         assert user_cursor == "new_cursor"
 
-    def test_sensor_result_skip_reason_extracted(self):
-        """SensorResult with only a skip_reason yields the SkipReason."""
+    def test_sensor_result_skip_reason_preserved(self):
+        """SensorResult with skip_reason is yielded intact."""
 
         @sensor(job=_make_job())
         @resilient_sensor(threshold=3)
@@ -480,8 +478,8 @@ class TestSensorResult:
 
         results, cursor = _invoke_sensor(result_sensor)
         assert len(results) == 1
-        assert isinstance(results[0], SkipReason)
-        assert results[0].skip_message == "nothing to do"
+        assert isinstance(results[0], SensorResult)
+        assert results[0].skip_reason.skip_message == "nothing to do"
 
         guard_state, _ = parse_cursor(cursor)
         assert guard_state.error_count == 0
@@ -502,7 +500,7 @@ class TestSensorResult:
         # Tick 1: SensorResult success.
         results, cursor = _invoke_sensor(result_sensor)
         assert len(results) == 1
-        assert isinstance(results[0], RunRequest)
+        assert isinstance(results[0], SensorResult)
 
         # Tick 2: error suppressed.
         context = build_sensor_context(cursor=cursor)
@@ -557,3 +555,113 @@ class TestNoneReturn:
 
         guard_state, _ = parse_cursor(cursor)
         assert guard_state.error_count == 0
+
+
+class TestInputValidation:
+    def test_threshold_zero_raises(self):
+        with pytest.raises(ValueError, match="threshold must be >= 1"):
+            resilient_sensor(threshold=0)
+
+    def test_threshold_negative_raises(self):
+        with pytest.raises(ValueError, match="threshold must be >= 1"):
+            resilient_sensor(threshold=-1)
+
+    def test_window_minutes_zero_raises(self):
+        with pytest.raises(ValueError, match="window_minutes must be > 0"):
+            resilient_sensor(window_minutes=0)
+
+    def test_window_minutes_negative_raises(self):
+        with pytest.raises(ValueError, match="window_minutes must be > 0"):
+            resilient_sensor(window_minutes=-5)
+
+    def test_decay_amount_zero_raises(self):
+        with pytest.raises(ValueError, match="decay_amount must be >= 1"):
+            resilient_sensor(decay_amount=0)
+
+
+class TestSensorResultFields:
+    def test_dynamic_partitions_requests_preserved(self):
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
+        def dp_sensor(context):
+            return SensorResult(
+                run_requests=[RunRequest(run_key="dp-1")],
+                dynamic_partitions_requests=[
+                    AddDynamicPartitionsRequest(
+                        partitions_def_name="my_partitions",
+                        partition_keys=["2024-01-01"],
+                    ),
+                ],
+            )
+
+        results, _ = _invoke_sensor(dp_sensor)
+        assert len(results) == 1
+        sr = results[0]
+        assert isinstance(sr, SensorResult)
+        assert len(sr.run_requests) == 1
+        assert len(sr.dynamic_partitions_requests) == 1
+        assert sr.dynamic_partitions_requests[0].partition_keys == ["2024-01-01"]
+
+    def test_asset_events_preserved(self):
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=3)
+        def asset_sensor(context):
+            return SensorResult(
+                asset_events=[
+                    AssetMaterialization(asset_key=AssetKey("my_asset")),
+                ],
+            )
+
+        results, _ = _invoke_sensor(asset_sensor)
+        assert len(results) == 1
+        sr = results[0]
+        assert isinstance(sr, SensorResult)
+        assert len(sr.asset_events) == 1
+        assert sr.asset_events[0].asset_key == AssetKey("my_asset")
+
+
+class TestCallbackExceptionHandling:
+    def test_broken_callback_does_not_crash_sensor(self):
+        def bad_callback(error, count, threshold):
+            raise RuntimeError("callback exploded")
+
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=3, on_suppressed_error=bad_callback)
+        def failing_sensor(context):
+            raise ConnectionError("timeout")
+
+        results, cursor = _invoke_sensor(failing_sensor)
+        assert len(results) == 1
+        assert isinstance(results[0], SkipReason)
+        guard_state, _ = parse_cursor(cursor)
+        assert guard_state.error_count == 1
+
+    def test_broken_callback_logs_warning(self, caplog):
+        def bad_callback(error, count, threshold):
+            raise RuntimeError("callback exploded")
+
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=3, on_suppressed_error=bad_callback)
+        def failing_sensor(context):
+            raise ConnectionError("timeout")
+
+        with caplog.at_level(logging.WARNING, logger="dagster_sensor_guard.decorator"):
+            _invoke_sensor(failing_sensor)
+
+        assert "on_suppressed_error callback raised an exception" in caplog.text
+
+
+class TestAsyncSensorRejection:
+    def test_async_function_raises_type_error(self):
+        async def async_sensor(context):
+            pass
+
+        with pytest.raises(TypeError, match="does not support async"):
+            resilient_sensor(threshold=3)(async_sensor)
+
+    def test_async_generator_raises_type_error(self):
+        async def async_gen_sensor(context):
+            yield RunRequest(run_key="a")
+
+        with pytest.raises(TypeError, match="does not support async"):
+            resilient_sensor(threshold=3)(async_gen_sensor)

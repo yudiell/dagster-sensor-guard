@@ -2,7 +2,7 @@
 
 The guard stores its state alongside user cursor data in the sensor's cursor JSON.
 The cursor format is:
-    {"__sensor_guard": {...}, "__user_cursor": <user_value>}
+    {"__dagster_sensor_guard_v1": {...}, "__user_cursor": <user_value>}
 
 When no guard state exists (first tick), defaults are returned.
 When the user doesn't use cursors, __user_cursor is None.
@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 
 from dagster_sensor_guard.types import ResetStrategy
 
-_GUARD_KEY = "__sensor_guard"
+_GUARD_KEY = "__dagster_sensor_guard_v1"
 _USER_KEY = "__user_cursor"
 
 
@@ -78,9 +78,25 @@ def build_cursor(guard_state: GuardState, user_cursor: Optional[str]) -> str:
     })
 
 
-def increment_error(state: GuardState) -> GuardState:
-    """Record a new consecutive error."""
+def increment_error(
+    state: GuardState,
+    window_minutes: Optional[int] = None,
+) -> GuardState:
+    """Record a new consecutive error.
+
+    When window_minutes is set and the error chain has expired (first error
+    is older than the window), the state resets and a fresh chain starts.
+    """
     now = time.time()
+
+    # Check if the error chain has expired outside the window.
+    if (
+        window_minutes is not None
+        and state.first_error_ts is not None
+        and (now - state.first_error_ts) > window_minutes * 60
+    ):
+        state = GuardState()
+
     return GuardState(
         error_count=state.error_count + 1,
         first_error_ts=state.first_error_ts if state.first_error_ts is not None else now,
@@ -111,18 +127,11 @@ def apply_reset(
 def should_raise(
     state: GuardState,
     threshold: int,
-    window_minutes: Optional[int],
 ) -> bool:
     """Determine whether the current error should be raised to Dagster.
 
     The error should raise when the count exceeds the threshold.
-    When window_minutes is set, the counter resets if the first error is
-    outside the window — meaning should_raise returns False and the state
-    should be treated as a fresh error chain.
+    Window expiry is handled by increment_error(), so by the time this
+    function is called the state already reflects any window-based reset.
     """
-    if window_minutes is not None and state.first_error_ts is not None:
-        elapsed = time.time() - state.first_error_ts
-        if elapsed > window_minutes * 60:
-            return False
-
     return state.error_count > threshold

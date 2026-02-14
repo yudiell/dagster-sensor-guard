@@ -6,20 +6,7 @@ from dagster import SkipReason, build_sensor_context, sensor
 
 from dagster_sensor_guard import resilient_sensor
 from dagster_sensor_guard.state import parse_cursor
-
-
-def _make_job():
-    from dagster import job, op
-
-    @op
-    def noop():
-        pass
-
-    @job
-    def noop_job():
-        noop()
-
-    return noop_job
+from tests.conftest import make_job as _make_job
 
 
 class TestCursorIsolation:

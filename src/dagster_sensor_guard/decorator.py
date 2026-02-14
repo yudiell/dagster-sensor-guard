@@ -23,14 +23,13 @@ Implementation notes (from Dagster source investigation):
 from __future__ import annotations
 
 import inspect
+import logging
 from functools import update_wrapper
 from typing import Callable, Optional, Union
 
-from dagster import RunRequest, SensorDefinition, SensorResult, SkipReason
-from dagster._core.definitions.sensor_definition import SensorEvaluationContext
+from dagster import RunRequest, SensorDefinition, SensorEvaluationContext, SensorResult, SkipReason
 
 from dagster_sensor_guard.state import (
-    GuardState,
     apply_reset,
     build_cursor,
     increment_error,
@@ -38,6 +37,8 @@ from dagster_sensor_guard.state import (
     should_raise,
 )
 from dagster_sensor_guard.types import ResetStrategy
+
+logger = logging.getLogger(__name__)
 
 
 def resilient_sensor(
@@ -72,6 +73,13 @@ def resilient_sensor(
         on_suppressed_error: Optional callback invoked each time an error is
             suppressed. Signature: (error, current_count, threshold) -> None.
     """
+    if threshold < 1:
+        raise ValueError(f"threshold must be >= 1, got {threshold}")
+    if window_minutes is not None and window_minutes <= 0:
+        raise ValueError(f"window_minutes must be > 0, got {window_minutes}")
+    if decay_amount < 1:
+        raise ValueError(f"decay_amount must be >= 1, got {decay_amount}")
+
     reset_enum = ResetStrategy(reset_strategy)
 
     def decorator(fn: Callable) -> Callable:
@@ -82,6 +90,12 @@ def resilient_sensor(
                 "    @sensor(job=my_job)\n"
                 "    @resilient_sensor(threshold=3)\n"
                 "    def my_sensor(context): ..."
+            )
+
+        if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
+            raise TypeError(
+                "@resilient_sensor does not support async sensor functions. "
+                "Use a synchronous function instead."
             )
 
         def wrapped_fn(context: SensorEvaluationContext):
@@ -104,16 +118,15 @@ def resilient_sensor(
                             has_run_request = True
                         yield item
                 elif isinstance(result, SensorResult):
-                    # SensorResult is a NamedTuple — yielding it raw would
-                    # unpack its fields. Extract components instead.
                     if result.run_requests:
-                        for rr in result.run_requests:
-                            has_run_request = True
-                            yield rr
-                    if result.skip_reason:
-                        yield result.skip_reason
+                        has_run_request = True
                     if result.cursor is not None:
                         context.update_cursor(result.cursor)
+                    # Yield the SensorResult for Dagster to process all fields
+                    # (including automation_condition_evaluations and any
+                    # future fields). Cursor is stripped since we handle it
+                    # via namespacing.
+                    yield result._replace(cursor=None)
                 elif isinstance(result, (list, tuple)):
                     for item in result:
                         if isinstance(item, RunRequest):
@@ -126,30 +139,24 @@ def resilient_sensor(
 
             except Exception as exc:
                 # --- Error path ---
-                guard_state = increment_error(guard_state)
-
-                # When window_minutes is set, check if the error chain has expired.
-                # If so, reset and start a fresh chain with this error.
-                if (
-                    window_minutes is not None
-                    and guard_state.first_error_ts is not None
-                ):
-                    import time
-
-                    elapsed = time.time() - guard_state.first_error_ts
-                    if elapsed > window_minutes * 60:
-                        guard_state = increment_error(GuardState())
+                guard_state = increment_error(guard_state, window_minutes)
 
                 # Persist state before deciding to raise or suppress.
                 updated_user_cursor = _read_user_cursor(context, user_cursor)
                 context.update_cursor(build_cursor(guard_state, updated_user_cursor))
 
-                if should_raise(guard_state, threshold, window_minutes):
+                if should_raise(guard_state, threshold):
                     raise
 
                 # Suppress the error.
                 if on_suppressed_error is not None:
-                    on_suppressed_error(exc, guard_state.error_count, threshold)
+                    try:
+                        on_suppressed_error(exc, guard_state.error_count, threshold)
+                    except Exception:
+                        logger.warning(
+                            "on_suppressed_error callback raised an exception",
+                            exc_info=True,
+                        )
 
                 # Only yield SkipReason if no RunRequests were yielded this tick
                 # (Dagster forbids mixing SkipReason with RunRequest).
