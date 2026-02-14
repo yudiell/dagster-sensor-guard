@@ -109,6 +109,11 @@ class TestApplyReset:
         result = apply_reset(state, ResetStrategy.DECAY, decay_amount=5)
         assert result == GuardState()
 
+    def test_decay_on_zero_count(self):
+        state = GuardState()
+        result = apply_reset(state, ResetStrategy.DECAY, decay_amount=1)
+        assert result == GuardState()
+
 
 class TestShouldRaise:
     def test_count_below_threshold(self):
