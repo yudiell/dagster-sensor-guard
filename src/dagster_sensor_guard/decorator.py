@@ -30,6 +30,7 @@ from typing import Callable, Optional, Union
 from dagster import RunRequest, SensorDefinition, SensorEvaluationContext, SensorResult, SkipReason
 
 from dagster_sensor_guard.state import (
+    GuardState,
     apply_reset,
     build_cursor,
     increment_error,
@@ -105,7 +106,6 @@ def resilient_sensor(
 
             # Expose only the user's cursor to the sensor function.
             context._cursor = user_cursor  # noqa: SLF001
-            context._cursor_updated = False  # noqa: SLF001
 
             has_run_request = False
 
@@ -141,12 +141,21 @@ def resilient_sensor(
                 # --- Error path ---
                 guard_state = increment_error(guard_state, window_minutes)
 
-                # Persist state before deciding to raise or suppress.
-                updated_user_cursor = _read_user_cursor(context, user_cursor)
-                context.update_cursor(build_cursor(guard_state, updated_user_cursor))
+                # Read the user cursor before we overwrite with the envelope.
+                updated_user_cursor = context.cursor
 
                 if should_raise(guard_state, threshold):
+                    # Persist a *reset* state so recovery is possible on the
+                    # next tick.  Dagster may not persist cursor on failed
+                    # ticks, but if it does, a fresh counter lets the sensor
+                    # suppress transient errors again after the breach.
+                    context.update_cursor(
+                        build_cursor(GuardState(), updated_user_cursor)
+                    )
                     raise
+
+                # Persist the incremented error count for suppressed errors.
+                context.update_cursor(build_cursor(guard_state, updated_user_cursor))
 
                 # Suppress the error.
                 if on_suppressed_error is not None:
@@ -169,24 +178,12 @@ def resilient_sensor(
 
             # --- Success path ---
             guard_state = apply_reset(guard_state, reset_enum, decay_amount)
-            updated_user_cursor = _read_user_cursor(context, user_cursor)
-            context.update_cursor(build_cursor(guard_state, updated_user_cursor))
+            context.update_cursor(
+                build_cursor(guard_state, context.cursor)
+            )
 
         # Preserve function metadata for Dagster introspection.
         update_wrapper(wrapped_fn, fn)
         return wrapped_fn
 
     return decorator
-
-
-def _read_user_cursor(
-    context: SensorEvaluationContext, original_user_cursor: Optional[str]
-) -> Optional[str]:
-    """Read back the user's cursor after sensor evaluation.
-
-    If the user called update_cursor(), use whatever they set.
-    Otherwise, fall back to what we injected before the call.
-    """
-    if context.cursor_updated:
-        return context.cursor
-    return original_user_cursor

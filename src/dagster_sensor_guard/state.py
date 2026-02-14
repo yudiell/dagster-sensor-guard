@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 from dagster_sensor_guard.types import ResetStrategy
 
 _GUARD_KEY = "__dagster_sensor_guard_v1"
+_GUARD_KEY_LEGACY = "__sensor_guard"
 _USER_KEY = "__user_cursor"
 
 
@@ -61,11 +62,20 @@ def parse_cursor(raw_cursor: Optional[str]) -> Tuple[GuardState, Optional[str]]:
         # Cursor is a plain string from the user, not our JSON wrapper.
         return GuardState(), raw_cursor
 
-    if not isinstance(data, dict) or _GUARD_KEY not in data:
-        # Valid JSON but not our format — treat as user cursor.
+    if not isinstance(data, dict):
+        # Valid JSON but not a dict — treat as user cursor.
         return GuardState(), raw_cursor
 
-    guard_state = GuardState.from_dict(data[_GUARD_KEY])
+    # Support both the current key and the legacy key for backward compat.
+    if _GUARD_KEY in data:
+        guard_data = data[_GUARD_KEY]
+    elif _GUARD_KEY_LEGACY in data:
+        guard_data = data[_GUARD_KEY_LEGACY]
+    else:
+        # Dict but not our format — treat as user cursor.
+        return GuardState(), raw_cursor
+
+    guard_state = GuardState.from_dict(guard_data)
     user_cursor = data.get(_USER_KEY)
     return guard_state, user_cursor
 

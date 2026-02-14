@@ -53,6 +53,56 @@ class TestParseCursor:
         assert user_cursor is None
 
 
+    def test_legacy_guard_key_parsed(self):
+        """Cursors written with the old __sensor_guard key should still parse."""
+        raw = json.dumps({
+            "__sensor_guard": {"error_count": 2, "first_error_ts": 500.0, "last_error_ts": 600.0},
+            "__user_cursor": "36",
+        })
+        state, user_cursor = parse_cursor(raw)
+        assert state.error_count == 2
+        assert state.first_error_ts == 500.0
+        assert user_cursor == "36"
+
+    def test_legacy_key_does_not_leak_envelope_as_user_cursor(self):
+        """Root-cause regression: when only the legacy key is present,
+        parse_cursor must extract __user_cursor — not return the entire
+        JSON string as the user cursor."""
+        raw = json.dumps({
+            "__sensor_guard": {"error_count": 3},
+            "__user_cursor": "42",
+        })
+        _, user_cursor = parse_cursor(raw)
+
+        # The bug: without legacy key support parse_cursor fell through to
+        # the "not our format" branch and returned the full JSON string.
+        assert user_cursor == "42"
+        assert "__sensor_guard" not in (user_cursor or "")
+
+    def test_legacy_key_with_none_user_cursor(self):
+        raw = json.dumps({
+            "__sensor_guard": {"error_count": 1},
+            "__user_cursor": None,
+        })
+        state, user_cursor = parse_cursor(raw)
+        assert state.error_count == 1
+        assert user_cursor is None
+
+    def test_legacy_cursor_migrates_on_roundtrip(self):
+        """A legacy cursor parsed then rebuilt should use the new key."""
+        legacy = json.dumps({
+            "__sensor_guard": {"error_count": 2},
+            "__user_cursor": "99",
+        })
+        state, user_cursor = parse_cursor(legacy)
+        rebuilt = build_cursor(state, user_cursor)
+
+        data = json.loads(rebuilt)
+        assert "__dagster_sensor_guard_v1" in data
+        assert "__sensor_guard" not in data
+        assert data["__user_cursor"] == "99"
+
+
 class TestBuildCursor:
     def test_roundtrip(self):
         state = GuardState(error_count=2, first_error_ts=100.0, last_error_ts=200.0)
