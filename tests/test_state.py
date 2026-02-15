@@ -1,122 +1,115 @@
-"""Tests for state management and cursor serialization."""
+"""Tests for state management and KVS storage."""
 
 import json
 import time
 from unittest.mock import patch
 
+from dagster import DagsterInstance
+
 from dagster_sensor_guard.state import (
     GuardState,
     apply_reset,
-    build_cursor,
+    detect_envelope_cursor,
     increment_error,
-    parse_cursor,
+    kvs_key,
+    load_guard_state,
+    save_guard_state,
     should_raise,
 )
 from dagster_sensor_guard.types import ResetStrategy
 
 
-class TestParseCursor:
-    def test_none_cursor(self):
-        state, user_cursor = parse_cursor(None)
-        assert state == GuardState()
-        assert user_cursor is None
+class TestKvsKey:
+    def test_key_format(self):
+        assert kvs_key("my_sensor") == "dagster_sensor_guard:my_sensor"
 
-    def test_plain_string_cursor(self):
-        state, user_cursor = parse_cursor("my_offset_123")
+    def test_different_sensors_get_different_keys(self):
+        assert kvs_key("sensor_a") != kvs_key("sensor_b")
+
+
+class TestLoadGuardState:
+    def test_returns_default_when_no_state(self, instance):
+        state = load_guard_state(instance.daemon_cursor_storage, "nonexistent")
         assert state == GuardState()
-        assert user_cursor == "my_offset_123"
+
+    def test_roundtrip_with_save(self, instance):
+        original = GuardState(error_count=3, first_error_ts=100.0, last_error_ts=200.0)
+        save_guard_state(instance.daemon_cursor_storage, "test_sensor", original)
+        loaded = load_guard_state(instance.daemon_cursor_storage, "test_sensor")
+        assert loaded == original
+
+    def test_returns_default_on_corrupt_data(self, instance):
+        key = kvs_key("corrupt_sensor")
+        instance.daemon_cursor_storage.set_cursor_values({key: "not-valid-json"})
+        state = load_guard_state(instance.daemon_cursor_storage, "corrupt_sensor")
+        assert state == GuardState()
+
+    def test_sensors_are_isolated(self, instance):
+        save_guard_state(
+            instance.daemon_cursor_storage,
+            "sensor_a",
+            GuardState(error_count=5),
+        )
+        state_b = load_guard_state(instance.daemon_cursor_storage, "sensor_b")
+        assert state_b == GuardState()
+
+
+class TestSaveGuardState:
+    def test_overwrites_previous_state(self, instance):
+        storage = instance.daemon_cursor_storage
+        save_guard_state(storage, "test", GuardState(error_count=1))
+        save_guard_state(storage, "test", GuardState(error_count=5))
+        loaded = load_guard_state(storage, "test")
+        assert loaded.error_count == 5
+
+
+class TestDetectEnvelopeCursor:
+    def test_none_cursor(self):
+        assert detect_envelope_cursor(None) is None
+
+    def test_plain_string(self):
+        assert detect_envelope_cursor("my_offset_123") is None
 
     def test_json_without_guard_key(self):
         raw = json.dumps({"offset": 42, "batch": "abc"})
-        state, user_cursor = parse_cursor(raw)
-        assert state == GuardState()
-        assert user_cursor == raw
+        assert detect_envelope_cursor(raw) is None
 
-    def test_valid_guard_cursor(self):
+    def test_v1_envelope(self):
         raw = json.dumps({
             "__dagster_sensor_guard_v1": {"error_count": 3, "first_error_ts": 1000.0, "last_error_ts": 1010.0},
             "__user_cursor": "user_data",
         })
-        state, user_cursor = parse_cursor(raw)
+        result = detect_envelope_cursor(raw)
+        assert result is not None
+        state, user_cursor = result
         assert state.error_count == 3
         assert state.first_error_ts == 1000.0
-        assert state.last_error_ts == 1010.0
         assert user_cursor == "user_data"
 
-    def test_guard_cursor_with_none_user(self):
-        raw = json.dumps({
-            "__dagster_sensor_guard_v1": {"error_count": 1},
-            "__user_cursor": None,
-        })
-        state, user_cursor = parse_cursor(raw)
-        assert state.error_count == 1
-        assert user_cursor is None
-
-
-    def test_legacy_guard_key_parsed(self):
-        """Cursors written with the old __sensor_guard key should still parse."""
+    def test_legacy_envelope(self):
         raw = json.dumps({
             "__sensor_guard": {"error_count": 2, "first_error_ts": 500.0, "last_error_ts": 600.0},
             "__user_cursor": "36",
         })
-        state, user_cursor = parse_cursor(raw)
+        result = detect_envelope_cursor(raw)
+        assert result is not None
+        state, user_cursor = result
         assert state.error_count == 2
-        assert state.first_error_ts == 500.0
         assert user_cursor == "36"
 
-    def test_legacy_key_does_not_leak_envelope_as_user_cursor(self):
-        """Root-cause regression: when only the legacy key is present,
-        parse_cursor must extract __user_cursor — not return the entire
-        JSON string as the user cursor."""
+    def test_envelope_with_none_user_cursor(self):
         raw = json.dumps({
-            "__sensor_guard": {"error_count": 3},
-            "__user_cursor": "42",
-        })
-        _, user_cursor = parse_cursor(raw)
-
-        # The bug: without legacy key support parse_cursor fell through to
-        # the "not our format" branch and returned the full JSON string.
-        assert user_cursor == "42"
-        assert "__sensor_guard" not in (user_cursor or "")
-
-    def test_legacy_key_with_none_user_cursor(self):
-        raw = json.dumps({
-            "__sensor_guard": {"error_count": 1},
+            "__dagster_sensor_guard_v1": {"error_count": 1},
             "__user_cursor": None,
         })
-        state, user_cursor = parse_cursor(raw)
+        result = detect_envelope_cursor(raw)
+        assert result is not None
+        state, user_cursor = result
         assert state.error_count == 1
         assert user_cursor is None
 
-    def test_legacy_cursor_migrates_on_roundtrip(self):
-        """A legacy cursor parsed then rebuilt should use the new key."""
-        legacy = json.dumps({
-            "__sensor_guard": {"error_count": 2},
-            "__user_cursor": "99",
-        })
-        state, user_cursor = parse_cursor(legacy)
-        rebuilt = build_cursor(state, user_cursor)
-
-        data = json.loads(rebuilt)
-        assert "__dagster_sensor_guard_v1" in data
-        assert "__sensor_guard" not in data
-        assert data["__user_cursor"] == "99"
-
-
-class TestBuildCursor:
-    def test_roundtrip(self):
-        state = GuardState(error_count=2, first_error_ts=100.0, last_error_ts=200.0)
-        cursor = build_cursor(state, "my_cursor")
-        parsed_state, parsed_user = parse_cursor(cursor)
-        assert parsed_state == state
-        assert parsed_user == "my_cursor"
-
-    def test_roundtrip_none_user(self):
-        state = GuardState()
-        cursor = build_cursor(state, None)
-        parsed_state, parsed_user = parse_cursor(cursor)
-        assert parsed_state == state
-        assert parsed_user is None
+    def test_json_array_not_detected(self):
+        assert detect_envelope_cursor("[1, 2, 3]") is None
 
 
 class TestIncrementError:

@@ -9,6 +9,7 @@ from dagster import (
     AddDynamicPartitionsRequest,
     AssetKey,
     AssetMaterialization,
+    DagsterInstance,
     RunRequest,
     SensorResult,
     SkipReason,
@@ -17,22 +18,26 @@ from dagster import (
 )
 
 from dagster_sensor_guard import resilient_sensor
-from dagster_sensor_guard.state import _GUARD_KEY, parse_cursor
+from dagster_sensor_guard.state import GuardState, load_guard_state, save_guard_state
 from tests.conftest import make_job as _make_job
 
+_SENSOR_NAME = "test_sensor"
 
-def _invoke_sensor(sensor_def, cursor=None):
+
+def _invoke_sensor(sensor_def, instance, cursor=None, sensor_name=_SENSOR_NAME):
     """Invoke a sensor and collect all yielded results.
 
-    Returns (results, updated_cursor).
+    Returns (results, context).
     """
-    context = build_sensor_context(cursor=cursor)
+    context = build_sensor_context(
+        cursor=cursor, instance=instance, sensor_name=sensor_name,
+    )
     results = list(sensor_def(context))
-    return results, context._cursor  # noqa: SLF001
+    return results, context
 
 
 class TestCountThreshold:
-    def test_errors_below_threshold_are_suppressed(self):
+    def test_errors_below_threshold_are_suppressed(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=3)
         def failing_sensor(context):
@@ -40,15 +45,17 @@ class TestCountThreshold:
 
         cursor = None
         for i in range(3):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             results = list(failing_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
             assert len(results) == 1
             assert isinstance(results[0], SkipReason)
             assert "Suppressed transient error" in results[0].skip_message
             assert f"({i + 1}/3)" in results[0].skip_message
 
-    def test_error_at_threshold_plus_one_raises(self):
+    def test_error_at_threshold_plus_one_raises(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=2)
         def failing_sensor(context):
@@ -57,32 +64,33 @@ class TestCountThreshold:
         cursor = None
         # First 2 are suppressed.
         for _ in range(2):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(failing_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
         # Third should raise.
-        context = build_sensor_context(cursor=cursor)
-        try:
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        with pytest.raises(ConnectionError):
             list(failing_sensor(context))
-            assert False, "Should have raised"
-        except ConnectionError:
-            pass
 
-    def test_error_on_first_tick(self):
+    def test_error_on_first_tick(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=3)
         def failing_sensor(context):
             raise RuntimeError("boom")
 
-        results, _ = _invoke_sensor(failing_sensor)
+        results, _ = _invoke_sensor(failing_sensor, instance)
         assert len(results) == 1
         assert isinstance(results[0], SkipReason)
         assert "(1/3)" in results[0].skip_message
 
 
 class TestTimeWindowThreshold:
-    def test_errors_within_window_accumulate(self):
+    def test_errors_within_window_accumulate(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=2, window_minutes=10)
         def failing_sensor(context):
@@ -90,19 +98,20 @@ class TestTimeWindowThreshold:
 
         cursor = None
         for _ in range(2):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(failing_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
         # Third should raise (within window).
-        context = build_sensor_context(cursor=cursor)
-        try:
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        with pytest.raises(ConnectionError):
             list(failing_sensor(context))
-            assert False, "Should have raised"
-        except ConnectionError:
-            pass
 
-    def test_errors_outside_window_reset_counter(self):
+    def test_errors_outside_window_reset_counter(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=2, window_minutes=10)
         def failing_sensor(context):
@@ -111,17 +120,25 @@ class TestTimeWindowThreshold:
         # Simulate 2 errors.
         cursor = None
         for _ in range(2):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(failing_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
-        # Manipulate the cursor to make first_error_ts old (outside window).
-        data = json.loads(cursor)
-        data[_GUARD_KEY]["first_error_ts"] = 1000.0  # very old
-        cursor = json.dumps(data)
+        # Manipulate KVS state to make first_error_ts old (outside window).
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        expired_state = GuardState(
+            error_count=state.error_count,
+            first_error_ts=1000.0,  # very old
+            last_error_ts=state.last_error_ts,
+        )
+        save_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME, expired_state)
 
         # Next error should be suppressed (counter reset due to window expiry).
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         results = list(failing_sensor(context))
         assert len(results) == 1
         assert isinstance(results[0], SkipReason)
@@ -129,7 +146,7 @@ class TestTimeWindowThreshold:
 
 
 class TestFullReset:
-    def test_success_clears_error_count(self):
+    def test_success_clears_error_count(self, instance):
         tick = 0
 
         @sensor(job=_make_job())
@@ -144,26 +161,27 @@ class TestFullReset:
         cursor = None
         # 3 errors.
         for _ in range(3):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(flapping_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
-        # Verify error count is 3.
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 3
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 3
 
         # One success.
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(flapping_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
 
-        # Error count should be reset to 0.
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 0
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
 
 class TestDecayReset:
-    def test_success_decrements_by_decay_amount(self):
+    def test_success_decrements_by_decay_amount(self, instance):
         tick = 0
 
         @sensor(job=_make_job())
@@ -178,28 +196,26 @@ class TestDecayReset:
         cursor = None
         # 4 errors.
         for _ in range(4):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(flapping_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 4
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 4
 
         # One success with decay_amount=2.
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(flapping_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 2
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 2
 
-    def test_decay_accumulates_residual_across_rounds(self):
-        """Decay only subtracts 1 per success, so residual carries forward.
-
-        Pattern: fail, succeed, fail, fail, succeed — after the second succeed
-        the count should be 1 (not 0) because the single success only decays
-        the 2-error count by 1.
-        """
+    def test_decay_accumulates_residual_across_rounds(self, instance):
+        """Decay only subtracts 1 per success, so residual carries forward."""
         # F, S, F, F, S
         script = [False, True, False, False, True]
         tick = 0
@@ -217,25 +233,21 @@ class TestDecayReset:
         cursor = None
         counts = []
         for _ in script:
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(flapping_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
-            guard_state, _ = parse_cursor(cursor)
-            counts.append(guard_state.error_count)
+            cursor = context.cursor
+            state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+            counts.append(state.error_count)
 
-        # Tick 1: fail → 1
-        # Tick 2: succeed → decay 1→0
-        # Tick 3: fail → 1
-        # Tick 4: fail → 2
-        # Tick 5: succeed → decay 2→1 (residual!)
         assert counts == [1, 0, 1, 2, 1]
 
 
 class TestRecoveryAfterBreach:
-    def test_success_after_threshold_breach_resets_counter(self):
+    def test_success_after_threshold_breach_resets_counter(self, instance):
         """After threshold is breached and error raised, a subsequent success
         should reset the counter back to 0 (full reset strategy)."""
-        # 4 fails then succeed
         script = [False, False, False, False, True]
         tick = 0
 
@@ -253,35 +265,37 @@ class TestRecoveryAfterBreach:
 
         # First 3 errors are suppressed.
         for i in range(3):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             results = list(recovering_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
             assert isinstance(results[0], SkipReason)
             assert f"({i + 1}/3)" in results[0].skip_message
 
         # 4th error breaches threshold.
-        context = build_sensor_context(cursor=cursor)
-        try:
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        with pytest.raises(ConnectionError):
             list(recovering_sensor(context))
-            assert False, "Should have raised"
-        except ConnectionError:
-            cursor = context._cursor  # noqa: SLF001
 
         # 5th tick succeeds — counter should reset.
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         results = list(recovering_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
+        cursor = context.cursor
 
         assert len(results) == 1
         assert isinstance(results[0], SkipReason)
         assert results[0].skip_message == "OK"
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 0
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
-    def test_error_after_recovery_starts_fresh_count(self):
+    def test_error_after_recovery_starts_fresh_count(self, instance):
         """After recovering from a breach, new errors should start from (1/N)."""
-        # 4 fails, succeed, fail
         script = [False, False, False, False, True, False]
         tick = 0
 
@@ -299,37 +313,42 @@ class TestRecoveryAfterBreach:
 
         # 3 suppressed + 1 breach.
         for _ in range(3):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(recovering_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
-        context = build_sensor_context(cursor=cursor)
-        try:
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        with pytest.raises(ConnectionError):
             list(recovering_sensor(context))
-        except ConnectionError:
-            cursor = context._cursor  # noqa: SLF001
 
         # Tick 5: success, resets counter.
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(recovering_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
+        cursor = context.cursor
 
         # Tick 6: fail again — should be (1/3), proving counter reset.
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         results = list(recovering_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
 
         assert isinstance(results[0], SkipReason)
         assert "(1/3)" in results[0].skip_message
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 1
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 1
 
 
 class TestCursorLeakAfterBreach:
-    def test_user_sees_own_cursor_not_json_after_breach(self):
+    def test_user_sees_own_cursor_not_json_after_breach(self, instance):
         """After a breach, the user's sensor should see their cursor value,
-        not the raw JSON envelope — even with legacy key format."""
+        not any guard state data."""
         observed_cursors = []
         tick = 0
 
@@ -349,19 +368,24 @@ class TestCursorLeakAfterBreach:
 
         # 2 errors suppressed.
         for _ in range(2):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(cursor_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
         # 3rd error breaches.
-        context = build_sensor_context(cursor=cursor)
-        try:
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        with pytest.raises(ConnectionError):
             list(cursor_sensor(context))
-        except ConnectionError:
-            cursor = context._cursor  # noqa: SLF001
+        cursor = context.cursor
 
         # 4th tick succeeds — user must see their cursor, not JSON.
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(cursor_sensor(context))
 
         # Tick 1: None (no prior cursor)
@@ -370,12 +394,12 @@ class TestCursorLeakAfterBreach:
         assert observed_cursors[1] == "10"
         # Tick 3: "20" (set by tick 2)
         assert observed_cursors[2] == "20"
-        # Tick 4 (after breach): "30" (set by tick 3), NOT the JSON envelope
+        # Tick 4 (after breach): "30" (set by tick 3)
         assert observed_cursors[3] == "30"
 
-    def test_legacy_cursor_does_not_leak(self):
-        """A cursor persisted with the old __sensor_guard key should not
-        leak the JSON envelope into context.cursor."""
+    def test_legacy_cursor_migration(self, instance):
+        """A cursor persisted with the old envelope format should be migrated:
+        guard state moves to KVS, user cursor is restored."""
         observed = []
 
         @sensor(job=_make_job())
@@ -394,17 +418,24 @@ class TestCursorLeakAfterBreach:
             "__user_cursor": "36",
         })
 
-        context = build_sensor_context(cursor=legacy_cursor)
+        context = build_sensor_context(
+            cursor=legacy_cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(my_sensor(context))
 
+        # User sees their cursor, not the envelope.
         assert observed[0] == "36"
+        # Guard state was migrated to KVS.
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        # After a successful tick, state is reset.
+        assert state.error_count == 0
 
 
 class TestRootCauseCursorLeakCascade:
-    """Reproduce the exact failure chain: legacy key → leaked JSON cursor →
-    ValueError in user code → error count never resets → sensor stuck."""
+    """Reproduce the exact failure chain: legacy key -> leaked JSON cursor ->
+    ValueError in user code -> error count never resets -> sensor stuck."""
 
-    def test_int_cursor_valueerror_from_legacy_key(self):
+    def test_int_cursor_valueerror_from_legacy_key(self, instance):
         """A sensor that does int(context.cursor) must not get a ValueError
         because context.cursor is the raw JSON envelope."""
         observed_cursors = []
@@ -427,20 +458,17 @@ class TestRootCauseCursorLeakCascade:
             "__user_cursor": "36",
         })
 
-        # Without the fix this would raise ValueError because
-        # context.cursor would be the full JSON string.
-        context = build_sensor_context(cursor=legacy_cursor)
+        context = build_sensor_context(
+            cursor=legacy_cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         results = list(offset_sensor(context))
 
         assert observed_cursors[0] == "36"
         assert isinstance(results[0], SkipReason)
         assert "at 36" in results[0].skip_message
 
-    def test_never_recovers_when_cursor_leaks(self):
-        """End-to-end: legacy cursor → leaked JSON → every tick raises
-        ValueError → error count cycles at threshold → sensor stuck forever.
-
-        The fix must break this chain so the sensor can recover."""
+    def test_never_recovers_when_cursor_leaks(self, instance):
+        """End-to-end: legacy cursor -> migration -> sensor runs normally."""
         tick = 0
 
         @sensor(job=_make_job())
@@ -448,7 +476,6 @@ class TestRootCauseCursorLeakCascade:
         def offset_sensor(context):
             nonlocal tick
             tick += 1
-            # This is the user's real sensor code: parse cursor as int.
             offset = int(context.cursor or "0")
             context.update_cursor(str(offset + tick))
             yield SkipReason(f"at {offset}")
@@ -463,31 +490,25 @@ class TestRootCauseCursorLeakCascade:
             "__user_cursor": "100",
         })
 
-        # With the fix: parse_cursor recognises the legacy key, extracts
-        # user_cursor="100", and int("100") succeeds.
-        context = build_sensor_context(cursor=legacy_cursor)
+        context = build_sensor_context(
+            cursor=legacy_cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         results = list(offset_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
 
         assert isinstance(results[0], SkipReason)
         assert "at 100" in results[0].skip_message
 
-        # Verify the rebuilt cursor uses the new key (migration).
-        data = json.loads(cursor)
-        assert "__dagster_sensor_guard_v1" in data
-        assert "__sensor_guard" not in data
+        # User cursor is now native — no envelope.
+        assert context.cursor == "101"
 
 
 class TestRootCauseNeverRecovers:
-    """Reproduce the exact failure chain: Dagster drops cursor on raise →
-    count stays at threshold → every subsequent error re-breaches → sensor
-    never gets a chance to run apply_reset."""
+    """With KVS storage, the 'never recovers' bug is eliminated because
+    guard state persists independently of Dagster's cursor."""
 
-    def test_error_count_cycles_without_fix_simulation(self):
-        """Simulate what happens in real Dagster when cursor is not persisted
-        on raise: error count oscillates between threshold and threshold+1,
-        re-raising every error tick. Verify the sensor still recovers on
-        the first success tick."""
+    def test_kvs_persists_independently_of_tick_outcome(self, instance):
+        """Guard state in KVS persists even when Dagster drops the cursor
+        on a failed tick. This eliminates the cycling bug."""
         tick = 0
 
         @sensor(job=_make_job())
@@ -495,55 +516,51 @@ class TestRootCauseNeverRecovers:
         def cycling_sensor(context):
             nonlocal tick
             tick += 1
-            # Ticks 1-2: suppressed. Tick 3: breach. Tick 4: another error
-            # (still broken). Tick 5: success (issue resolved).
             if tick <= 4:
                 raise ConnectionError("down")
             yield SkipReason("recovered")
 
         cursor = None
 
-        # Ticks 1-2: suppressed errors, cursor persisted normally.
+        # Ticks 1-2: suppressed errors.
         for _ in range(2):
-            ctx = build_sensor_context(cursor=cursor)
+            ctx = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(cycling_sensor(ctx))
-            cursor = ctx._cursor  # noqa: SLF001
+            cursor = ctx.cursor
 
-        last_good_cursor = cursor  # count=2
-
-        # Tick 3: breach — Dagster drops the cursor update.
-        ctx = build_sensor_context(cursor=cursor)
-        try:
+        # Tick 3: breach — even if Dagster drops cursor, KVS has reset state.
+        ctx = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        with pytest.raises(ConnectionError):
             list(cycling_sensor(ctx))
-        except ConnectionError:
-            pass
-        # Simulate Dagster: revert to last_good_cursor.
-        cursor = last_good_cursor
 
-        # Tick 4: still broken — same cycle. count=2 → 3 → raise.
-        ctx = build_sensor_context(cursor=cursor)
-        try:
-            list(cycling_sensor(ctx))
-        except ConnectionError:
-            pass
-        # Dagster drops cursor again.
-        cursor = last_good_cursor
+        # KVS has reset state regardless of cursor.
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
-        # Tick 5: issue resolved — MUST recover despite count=2 in cursor.
-        ctx = build_sensor_context(cursor=cursor)
+        # Tick 4: still broken — fresh suppression starts.
+        ctx = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         results = list(cycling_sensor(ctx))
-        cursor = ctx._cursor  # noqa: SLF001
+        assert isinstance(results[0], SkipReason)
+        assert "(1/2)" in results[0].skip_message
 
-        assert len(results) == 1
+        # Tick 5: issue resolved — recovers.
+        ctx = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        results = list(cycling_sensor(ctx))
         assert results[0].skip_message == "recovered"
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 0
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
-    def test_fresh_retries_after_breach_when_cursor_persisted(self):
-        """When Dagster DOES persist cursor on raise (version-dependent),
-        the reset state gives the sensor fresh retries instead of
-        re-raising immediately on the next error."""
+    def test_fresh_retries_after_breach(self, instance):
+        """After breach, the reset state in KVS gives fresh retries."""
         tick = 0
 
         @sensor(job=_make_job())
@@ -559,39 +576,43 @@ class TestRootCauseNeverRecovers:
 
         # Ticks 1-2: suppressed (1/2, 2/2).
         for _ in range(2):
-            ctx = build_sensor_context(cursor=cursor)
+            ctx = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(retry_sensor(ctx))
-            cursor = ctx._cursor  # noqa: SLF001
+            cursor = ctx.cursor
 
-        # Tick 3: breach. Cursor IS persisted (reset state).
-        ctx = build_sensor_context(cursor=cursor)
-        try:
+        # Tick 3: breach. KVS resets.
+        ctx = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        with pytest.raises(ConnectionError):
             list(retry_sensor(ctx))
-        except ConnectionError:
-            cursor = ctx._cursor  # noqa: SLF001
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 0  # Reset, not stuck at 3
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0  # Reset, not stuck at 3
 
         # Ticks 4-5: fresh retries — suppressed as (1/2, 2/2).
         for expected_count in [1, 2]:
-            ctx = build_sensor_context(cursor=cursor)
+            ctx = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             results = list(retry_sensor(ctx))
-            cursor = ctx._cursor  # noqa: SLF001
 
             assert isinstance(results[0], SkipReason)
             assert f"({expected_count}/2)" in results[0].skip_message
 
         # Tick 6: success — recovery.
-        ctx = build_sensor_context(cursor=cursor)
+        ctx = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         results = list(retry_sensor(ctx))
         assert results[0].skip_message == "recovered"
 
 
 class TestBreachResetsForRecovery:
-    def test_breach_persists_reset_state(self):
-        """When the threshold is breached, the persisted cursor should have
-        error_count=0 so the sensor can recover with fresh retries."""
+    def test_breach_persists_reset_state(self, instance):
+        """When the threshold is breached, KVS should have error_count=0."""
 
         @sensor(job=_make_job())
         @resilient_sensor(threshold=2)
@@ -602,73 +623,28 @@ class TestBreachResetsForRecovery:
 
         # 2 suppressed errors.
         for _ in range(2):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(failing_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 2
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 2
 
-        # 3rd error breaches — cursor should have reset state.
-        context = build_sensor_context(cursor=cursor)
-        try:
+        # 3rd error breaches — KVS should have reset state.
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        with pytest.raises(ConnectionError):
             list(failing_sensor(context))
-        except ConnectionError:
-            cursor = context._cursor  # noqa: SLF001
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 0
-
-    def test_recovery_when_dagster_drops_cursor_on_raise(self):
-        """Simulate real Dagster: cursor is NOT persisted on failed ticks.
-        After a breach, the cursor reverts to the last suppression tick.
-        The sensor should still recover on the next success."""
-        tick = 0
-
-        @sensor(job=_make_job())
-        @resilient_sensor(threshold=2)
-        def recovering_sensor(context):
-            nonlocal tick
-            tick += 1
-            if tick <= 3:
-                raise ConnectionError("down")
-            yield SkipReason("OK")
-
-        cursor = None
-
-        # 2 suppressed errors — cursor persisted normally.
-        for _ in range(2):
-            context = build_sensor_context(cursor=cursor)
-            list(recovering_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
-
-        last_good_cursor = cursor  # Snapshot before breach
-
-        # 3rd error breaches — in real Dagster, cursor is NOT persisted.
-        context = build_sensor_context(cursor=cursor)
-        try:
-            list(recovering_sensor(context))
-        except ConnectionError:
-            pass  # Cursor update lost — Dagster doesn't persist on raise
-
-        # Simulate Dagster behavior: use last_good_cursor, NOT context._cursor.
-        cursor = last_good_cursor
-
-        # 4th tick: success — should recover even though count=2 persisted.
-        context = build_sensor_context(cursor=cursor)
-        results = list(recovering_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
-
-        assert len(results) == 1
-        assert isinstance(results[0], SkipReason)
-        assert results[0].skip_message == "OK"
-
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 0
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
 
 class TestCallback:
-    def test_on_suppressed_error_called(self):
+    def test_on_suppressed_error_called(self, instance):
         callback = MagicMock()
 
         @sensor(job=_make_job())
@@ -676,7 +652,7 @@ class TestCallback:
         def failing_sensor(context):
             raise ValueError("bad value")
 
-        _invoke_sensor(failing_sensor)
+        _invoke_sensor(failing_sensor, instance)
 
         callback.assert_called_once()
         args = callback.call_args[0]
@@ -684,7 +660,7 @@ class TestCallback:
         assert args[1] == 1  # error count
         assert args[2] == 3  # threshold
 
-    def test_callback_not_called_when_threshold_breached(self):
+    def test_callback_not_called_when_threshold_breached(self, instance):
         callback = MagicMock()
 
         @sensor(job=_make_job())
@@ -693,23 +669,24 @@ class TestCallback:
             raise ValueError("bad value")
 
         # First error is suppressed — callback called.
-        context = build_sensor_context()
+        context = build_sensor_context(
+            instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(failing_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
         assert callback.call_count == 1
 
         # Second error breaches threshold — callback NOT called.
-        context = build_sensor_context(cursor=cursor)
-        try:
+        context = build_sensor_context(
+            instance=instance, sensor_name=_SENSOR_NAME,
+        )
+        with pytest.raises(ValueError):
             list(failing_sensor(context))
-        except ValueError:
-            pass
         assert callback.call_count == 1  # unchanged
 
 
 class TestSensorIsolation:
-    def test_error_counts_are_independent_across_sensors(self):
-        """Each decorated sensor tracks its own error count via its own cursor."""
+    def test_error_counts_are_independent_across_sensors(self, instance):
+        """Each decorated sensor tracks its own error count in KVS."""
 
         @sensor(job=_make_job(), name="sensor_a")
         @resilient_sensor(threshold=3)
@@ -721,38 +698,36 @@ class TestSensorIsolation:
         def sensor_b(context):
             raise ConnectionError("sensor B down")
 
-        cursor_a = None
-        cursor_b = None
-
         # Fail sensor_a 3 times.
         for _ in range(3):
-            ctx = build_sensor_context(cursor=cursor_a)
+            ctx = build_sensor_context(
+                instance=instance, sensor_name="sensor_a",
+            )
             list(sensor_a(ctx))
-            cursor_a = ctx._cursor  # noqa: SLF001
 
-        # sensor_a is at 3 errors.
-        guard_a, _ = parse_cursor(cursor_a)
-        assert guard_a.error_count == 3
+        state_a = load_guard_state(instance.daemon_cursor_storage, "sensor_a")
+        assert state_a.error_count == 3
 
-        # sensor_b should still be at 0 — never ticked.
-        guard_b, _ = parse_cursor(cursor_b)
-        assert guard_b.error_count == 0
+        # sensor_b should still be at 0.
+        state_b = load_guard_state(instance.daemon_cursor_storage, "sensor_b")
+        assert state_b.error_count == 0
 
         # Fail sensor_b once.
-        ctx = build_sensor_context(cursor=cursor_b)
+        ctx = build_sensor_context(
+            instance=instance, sensor_name="sensor_b",
+        )
         list(sensor_b(ctx))
-        cursor_b = ctx._cursor  # noqa: SLF001
 
-        guard_b, _ = parse_cursor(cursor_b)
-        assert guard_b.error_count == 1
+        state_b = load_guard_state(instance.daemon_cursor_storage, "sensor_b")
+        assert state_b.error_count == 1
 
-        # sensor_a is still at 3 — unaffected by sensor_b.
-        guard_a, _ = parse_cursor(cursor_a)
-        assert guard_a.error_count == 3
+        # sensor_a is still at 3.
+        state_a = load_guard_state(instance.daemon_cursor_storage, "sensor_a")
+        assert state_a.error_count == 3
 
 
 class TestMultipleRunRequests:
-    def test_run_requests_forwarded_then_error_suppressed_no_skip(self):
+    def test_run_requests_forwarded_then_error_suppressed_no_skip(self, instance):
         """If RunRequests were yielded before the error, suppress without SkipReason."""
 
         @sensor(job=_make_job())
@@ -762,17 +737,16 @@ class TestMultipleRunRequests:
             yield RunRequest(run_key="b")
             raise ConnectionError("mid-stream failure")
 
-        results, cursor = _invoke_sensor(partial_sensor)
+        results, _ = _invoke_sensor(partial_sensor, instance)
 
         # Both RunRequests should have been yielded.
         assert len(results) == 2
         assert all(isinstance(r, RunRequest) for r in results)
 
-        # Error was suppressed (no SkipReason because RunRequests were yielded).
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 1
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 1
 
-    def test_multiple_run_requests_success(self):
+    def test_multiple_run_requests_success(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=5)
         def multi_sensor(context):
@@ -780,14 +754,14 @@ class TestMultipleRunRequests:
             yield RunRequest(run_key="b")
             yield RunRequest(run_key="c")
 
-        results, _ = _invoke_sensor(multi_sensor)
+        results, _ = _invoke_sensor(multi_sensor, instance)
         assert len(results) == 3
         assert all(isinstance(r, RunRequest) for r in results)
 
 
 class TestSensorResult:
-    def test_sensor_result_yielded_with_contents(self):
-        """SensorResult is yielded as-is (with cursor stripped) for Dagster to process."""
+    def test_sensor_result_yielded_with_contents(self, instance):
+        """SensorResult is yielded as-is for Dagster to process."""
 
         @sensor(job=_make_job())
         @resilient_sensor(threshold=3)
@@ -797,19 +771,19 @@ class TestSensorResult:
                 cursor="new_cursor",
             )
 
-        results, cursor = _invoke_sensor(result_sensor)
+        results, ctx = _invoke_sensor(result_sensor, instance)
         assert len(results) == 1
         assert isinstance(results[0], SensorResult)
         assert len(results[0].run_requests) == 2
         assert results[0].run_requests[0].run_key == "sr-1"
         assert results[0].run_requests[1].run_key == "sr-2"
-        assert results[0].cursor is None  # cursor stripped, handled via namespacing
+        # SensorResult passes through natively — cursor is preserved.
+        assert results[0].cursor == "new_cursor"
 
-        guard_state, user_cursor = parse_cursor(cursor)
-        assert guard_state.error_count == 0
-        assert user_cursor == "new_cursor"
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
-    def test_sensor_result_skip_reason_preserved(self):
+    def test_sensor_result_skip_reason_preserved(self, instance):
         """SensorResult with skip_reason is yielded intact."""
 
         @sensor(job=_make_job())
@@ -817,15 +791,15 @@ class TestSensorResult:
         def result_sensor(context):
             return SensorResult(skip_reason=SkipReason("nothing to do"))
 
-        results, cursor = _invoke_sensor(result_sensor)
+        results, _ = _invoke_sensor(result_sensor, instance)
         assert len(results) == 1
         assert isinstance(results[0], SensorResult)
         assert results[0].skip_reason.skip_message == "nothing to do"
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 0
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
-    def test_sensor_result_error_suppressed(self):
+    def test_sensor_result_error_suppressed(self, instance):
         """Error after a SensorResult tick should be suppressed."""
         tick = 0
 
@@ -839,12 +813,14 @@ class TestSensorResult:
             raise ConnectionError("timeout")
 
         # Tick 1: SensorResult success.
-        results, cursor = _invoke_sensor(result_sensor)
+        results, ctx = _invoke_sensor(result_sensor, instance)
         assert len(results) == 1
         assert isinstance(results[0], SensorResult)
 
         # Tick 2: error suppressed.
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=ctx.cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         results = list(result_sensor(context))
         assert len(results) == 1
         assert isinstance(results[0], SkipReason)
@@ -852,21 +828,21 @@ class TestSensorResult:
 
 
 class TestNoneReturn:
-    def test_sensor_returning_none(self):
-        """A sensor that returns None (no yield, no return) should succeed cleanly."""
+    def test_sensor_returning_none(self, instance):
+        """A sensor that returns None should succeed cleanly."""
 
         @sensor(job=_make_job())
         @resilient_sensor(threshold=3)
         def none_sensor(context):
-            pass  # returns None implicitly
+            pass
 
-        results, cursor = _invoke_sensor(none_sensor)
+        results, _ = _invoke_sensor(none_sensor, instance)
         assert len(results) == 0
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 0
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
-    def test_none_return_resets_error_count(self):
+    def test_none_return_resets_error_count(self, instance):
         """A None-returning success should still reset the error counter."""
         tick = 0
 
@@ -877,25 +853,27 @@ class TestNoneReturn:
             tick += 1
             if tick <= 2:
                 raise ConnectionError("timeout")
-            # Implicit None return on tick 3.
 
         cursor = None
         # 2 errors.
         for _ in range(2):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(none_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 2
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 2
 
         # Tick 3: success (None return), resets counter.
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(none_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
 
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 0
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
 
 class TestInputValidation:
@@ -921,7 +899,7 @@ class TestInputValidation:
 
 
 class TestSensorResultFields:
-    def test_dynamic_partitions_requests_preserved(self):
+    def test_dynamic_partitions_requests_preserved(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=3)
         def dp_sensor(context):
@@ -935,7 +913,7 @@ class TestSensorResultFields:
                 ],
             )
 
-        results, _ = _invoke_sensor(dp_sensor)
+        results, _ = _invoke_sensor(dp_sensor, instance)
         assert len(results) == 1
         sr = results[0]
         assert isinstance(sr, SensorResult)
@@ -943,7 +921,7 @@ class TestSensorResultFields:
         assert len(sr.dynamic_partitions_requests) == 1
         assert sr.dynamic_partitions_requests[0].partition_keys == ["2024-01-01"]
 
-    def test_asset_events_preserved(self):
+    def test_asset_events_preserved(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=3)
         def asset_sensor(context):
@@ -953,7 +931,7 @@ class TestSensorResultFields:
                 ],
             )
 
-        results, _ = _invoke_sensor(asset_sensor)
+        results, _ = _invoke_sensor(asset_sensor, instance)
         assert len(results) == 1
         sr = results[0]
         assert isinstance(sr, SensorResult)
@@ -962,7 +940,7 @@ class TestSensorResultFields:
 
 
 class TestCallbackExceptionHandling:
-    def test_broken_callback_does_not_crash_sensor(self):
+    def test_broken_callback_does_not_crash_sensor(self, instance):
         def bad_callback(error, count, threshold):
             raise RuntimeError("callback exploded")
 
@@ -971,13 +949,13 @@ class TestCallbackExceptionHandling:
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
-        results, cursor = _invoke_sensor(failing_sensor)
+        results, _ = _invoke_sensor(failing_sensor, instance)
         assert len(results) == 1
         assert isinstance(results[0], SkipReason)
-        guard_state, _ = parse_cursor(cursor)
-        assert guard_state.error_count == 1
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 1
 
-    def test_broken_callback_logs_warning(self, caplog):
+    def test_broken_callback_logs_warning(self, instance, caplog):
         def bad_callback(error, count, threshold):
             raise RuntimeError("callback exploded")
 
@@ -987,7 +965,7 @@ class TestCallbackExceptionHandling:
             raise ConnectionError("timeout")
 
         with caplog.at_level(logging.WARNING, logger="dagster_sensor_guard.decorator"):
-            _invoke_sensor(failing_sensor)
+            _invoke_sensor(failing_sensor, instance)
 
         assert "on_suppressed_error callback raised an exception" in caplog.text
 

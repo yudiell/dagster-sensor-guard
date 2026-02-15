@@ -1,16 +1,22 @@
-"""Tests for cursor isolation between user data and guard state."""
+"""Tests for cursor isolation between user data and guard state.
+
+With KVS storage, the user's cursor flows through Dagster natively.
+Guard state lives in daemon_cursor_storage, completely separate.
+"""
 
 import json
 
-from dagster import SkipReason, build_sensor_context, sensor
+from dagster import DagsterInstance, SkipReason, build_sensor_context, sensor
 
 from dagster_sensor_guard import resilient_sensor
-from dagster_sensor_guard.state import parse_cursor
+from dagster_sensor_guard.state import load_guard_state
 from tests.conftest import make_job as _make_job
+
+_SENSOR_NAME = "test_cursor_sensor"
 
 
 class TestCursorIsolation:
-    def test_user_cursor_preserved_through_success(self):
+    def test_user_cursor_preserved_through_success(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=5)
         def cursor_sensor(context):
@@ -21,15 +27,17 @@ class TestCursorIsolation:
 
         cursor = None
         for i in range(3):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(cursor_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
-        guard_state, user_cursor = parse_cursor(cursor)
-        assert user_cursor == "3"
-        assert guard_state.error_count == 0
+        assert cursor == "3"
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
-    def test_user_cursor_preserved_through_errors(self):
+    def test_user_cursor_preserved_through_errors(self, instance):
         tick = 0
 
         @sensor(job=_make_job())
@@ -37,7 +45,6 @@ class TestCursorIsolation:
         def cursor_sensor(context):
             nonlocal tick
             tick += 1
-            # First tick succeeds with cursor update, second tick fails.
             if tick == 1:
                 context.update_cursor("offset_100")
                 yield SkipReason("OK")
@@ -45,38 +52,41 @@ class TestCursorIsolation:
                 raise ConnectionError("timeout")
 
         # Tick 1: success, sets cursor.
-        context = build_sensor_context()
+        context = build_sensor_context(
+            instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(cursor_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
-
-        _, user_cursor = parse_cursor(cursor)
-        assert user_cursor == "offset_100"
+        cursor = context.cursor
+        assert cursor == "offset_100"
 
         # Tick 2: failure, user cursor should still be preserved.
-        context = build_sensor_context(cursor=cursor)
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(cursor_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
+        # User cursor is untouched — still "offset_100".
+        assert context.cursor == "offset_100"
 
-        guard_state, user_cursor = parse_cursor(cursor)
-        assert user_cursor == "offset_100"
-        assert guard_state.error_count == 1
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 1
 
-    def test_sensor_with_no_cursor_usage(self):
+    def test_sensor_with_no_cursor_usage(self, instance):
         @sensor(job=_make_job())
         @resilient_sensor(threshold=3)
         def simple_sensor(context):
             yield SkipReason("Nothing to do")
 
-        context = build_sensor_context()
+        context = build_sensor_context(
+            instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(simple_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
 
-        guard_state, user_cursor = parse_cursor(cursor)
-        assert user_cursor is None
-        assert guard_state.error_count == 0
+        assert context.cursor is None
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 0
 
-    def test_user_reads_own_cursor_not_guard_json(self):
-        """User should see their own cursor value, not the raw JSON with guard state."""
+    def test_user_reads_own_cursor_not_guard_json(self, instance):
+        """User should see their own cursor value, not any guard state."""
         observed_cursors = []
 
         @sensor(job=_make_job())
@@ -87,18 +97,22 @@ class TestCursorIsolation:
             yield SkipReason("OK")
 
         # First tick: no cursor set yet.
-        context = build_sensor_context()
+        context = build_sensor_context(
+            instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(cursor_sensor(context))
-        cursor = context._cursor  # noqa: SLF001
+        cursor = context.cursor
 
-        # Second tick: should see "my_value", not the JSON envelope.
-        context = build_sensor_context(cursor=cursor)
+        # Second tick: should see "my_value".
+        context = build_sensor_context(
+            cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+        )
         list(cursor_sensor(context))
 
         assert observed_cursors[0] is None
         assert observed_cursors[1] == "my_value"
 
-    def test_user_cursor_json_preserved(self):
+    def test_user_cursor_json_preserved(self, instance):
         """User cursors that are themselves JSON should roundtrip correctly."""
 
         @sensor(job=_make_job())
@@ -114,10 +128,11 @@ class TestCursorIsolation:
 
         cursor = None
         for _ in range(3):
-            context = build_sensor_context(cursor=cursor)
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
             list(json_cursor_sensor(context))
-            cursor = context._cursor  # noqa: SLF001
+            cursor = context.cursor
 
-        _, user_cursor = parse_cursor(cursor)
-        user_data = json.loads(user_cursor)
+        user_data = json.loads(cursor)
         assert user_data == {"count": 3}

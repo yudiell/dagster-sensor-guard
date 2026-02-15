@@ -1,6 +1,7 @@
 """Shared test helpers for dagster-sensor-guard."""
 
-from dagster import job, op
+import pytest
+from dagster import DagsterInstance, job, op
 
 
 def make_job():
@@ -15,3 +16,9 @@ def make_job():
         noop()
 
     return noop_job
+
+
+@pytest.fixture
+def instance():
+    with DagsterInstance.ephemeral() as inst:
+        yield inst

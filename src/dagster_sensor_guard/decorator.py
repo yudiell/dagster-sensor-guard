@@ -1,23 +1,11 @@
 """The @resilient_sensor decorator for Dagster sensors.
 
-Implementation notes (from Dagster source investigation):
+Guard state is stored in Dagster's daemon_cursor_storage (KVS), completely
+decoupled from the user's sensor cursor. The user's cursor flows through
+Dagster natively, untouched.
 
-- @resilient_sensor wraps the raw sensor function BEFORE @sensor processes it.
-  @sensor then receives the wrapped function and builds the SensorDefinition.
-
-- context.cursor is Optional[str] — None when unset.
-  context.update_cursor() accepts Optional[str].
-
-- Dagster's wrap_sensor_evaluation iterates generators via next() in a loop.
-  Exceptions from the user's generator propagate through next(). Our wrapper
-  manually iterates to catch mid-generator exceptions.
-
-- Dagster forbids yielding both SkipReason and RunRequest in the same tick
-  (check.failed in evaluate_tick). We track whether RunRequests were yielded
-  and skip the SkipReason if so.
-
-- We use context.update_cursor() before/after calling the user's function
-  to transparently namespace guard state alongside user cursor data.
+Migration: On the first tick after upgrade, any old envelope-format cursor
+is detected, guard state is moved to KVS, and the user's cursor is restored.
 """
 
 from __future__ import annotations
@@ -32,9 +20,10 @@ from dagster import RunRequest, SensorDefinition, SensorEvaluationContext, Senso
 from dagster_sensor_guard.state import (
     GuardState,
     apply_reset,
-    build_cursor,
+    detect_envelope_cursor,
     increment_error,
-    parse_cursor,
+    load_guard_state,
+    save_guard_state,
     should_raise,
 )
 from dagster_sensor_guard.types import ResetStrategy
@@ -100,14 +89,18 @@ def resilient_sensor(
             )
 
         def wrapped_fn(context: SensorEvaluationContext):
-            # --- Cursor setup: extract guard state, expose user cursor ---
-            raw_cursor = context.cursor
-            guard_state, user_cursor = parse_cursor(raw_cursor)
+            storage = context.instance.daemon_cursor_storage
+            sensor_name = context.sensor_name
 
-            # Expose only the user's cursor to the sensor function.
-            # Use the public API rather than touching context._cursor directly,
-            # which breaks across Dagster versions.
-            context.update_cursor(user_cursor)
+            # --- One-time migration from envelope cursor ---
+            envelope = detect_envelope_cursor(context.cursor)
+            if envelope is not None:
+                old_guard_state, user_cursor = envelope
+                save_guard_state(storage, sensor_name, old_guard_state)
+                context.update_cursor(user_cursor)
+
+            # --- Load guard state from KVS ---
+            guard_state = load_guard_state(storage, sensor_name)
 
             has_run_request = False
 
@@ -122,13 +115,7 @@ def resilient_sensor(
                 elif isinstance(result, SensorResult):
                     if result.run_requests:
                         has_run_request = True
-                    if result.cursor is not None:
-                        context.update_cursor(result.cursor)
-                    # Yield the SensorResult for Dagster to process all fields
-                    # (including automation_condition_evaluations and any
-                    # future fields). Cursor is stripped since we handle it
-                    # via namespacing.
-                    yield result._replace(cursor=None)
+                    yield result
                 elif isinstance(result, (list, tuple)):
                     for item in result:
                         if isinstance(item, RunRequest):
@@ -143,21 +130,13 @@ def resilient_sensor(
                 # --- Error path ---
                 guard_state = increment_error(guard_state, window_minutes)
 
-                # Read the user cursor before we overwrite with the envelope.
-                updated_user_cursor = context.cursor
-
                 if should_raise(guard_state, threshold):
-                    # Persist a *reset* state so recovery is possible on the
-                    # next tick.  Dagster may not persist cursor on failed
-                    # ticks, but if it does, a fresh counter lets the sensor
-                    # suppress transient errors again after the breach.
-                    context.update_cursor(
-                        build_cursor(GuardState(), updated_user_cursor)
-                    )
+                    # Reset for recovery on the next tick.
+                    save_guard_state(storage, sensor_name, GuardState())
                     raise
 
-                # Persist the incremented error count for suppressed errors.
-                context.update_cursor(build_cursor(guard_state, updated_user_cursor))
+                # Persist the incremented error count.
+                save_guard_state(storage, sensor_name, guard_state)
 
                 # Suppress the error.
                 if on_suppressed_error is not None:
@@ -180,9 +159,7 @@ def resilient_sensor(
 
             # --- Success path ---
             guard_state = apply_reset(guard_state, reset_enum, decay_amount)
-            context.update_cursor(
-                build_cursor(guard_state, context.cursor)
-            )
+            save_guard_state(storage, sensor_name, guard_state)
 
         # Preserve function metadata for Dagster introspection.
         update_wrapper(wrapped_fn, fn)
