@@ -10,6 +10,8 @@ pip install dagster-sensor-guard
 
 ## Quick Start
 
+> **`@resilient_sensor` must be placed below `@sensor`, not above it.** It wraps the raw function before `@sensor` processes it. Reversing the order will raise a `TypeError`.
+
 All parameters are optional. The simplest usage with sensible defaults:
 
 ```python
@@ -138,7 +140,7 @@ The callback is invoked each time an error is suppressed (not when the threshold
 
 ## Cursor Transparency
 
-The decorator transparently namespaces its state in the sensor cursor. Your existing cursor logic works without modification:
+Guard state is stored in Dagster's `daemon_cursor_storage` (a SQL-backed key-value store), completely separate from your sensor cursor. Your cursor flows through Dagster natively, untouched:
 
 ```python
 @sensor(job=my_job)
@@ -149,7 +151,7 @@ def my_sensor(context):
     context.update_cursor(str(new_offset))
 ```
 
-`context.cursor` returns your value, not the internal guard state. `context.update_cursor()` works as expected.
+`context.cursor` is always your value — no JSON envelope, no hidden state. `context.update_cursor()` works as expected. The Dagster UI shows your cursor, not guard internals.
 
 ## License
 
