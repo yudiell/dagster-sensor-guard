@@ -2,7 +2,7 @@
 
 import logging
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from dagster import (
@@ -119,7 +119,7 @@ class TestPerKeyIsolation:
             instance.daemon_cursor_storage, _SENSOR_NAME
         )
         assert key_states["orders"].error_count == 3
-        assert key_states["customers"].error_count == 0
+        assert key_states.get("customers", GuardState()).error_count == 0
 
     def test_different_sensors_per_key_isolated(self, instance):
         """Per-key state for different sensors is isolated."""
@@ -146,7 +146,7 @@ class TestPerKeyIsolation:
         y_states = load_all_key_states(instance.daemon_cursor_storage, "sensor_y")
 
         assert x_states["key_a"].error_count == 1
-        assert y_states["key_a"].error_count == 0
+        assert y_states.get("key_a", GuardState()).error_count == 0
 
 
 class TestPerKeyReset:
@@ -178,7 +178,7 @@ class TestPerKeyReset:
         key_states = load_all_key_states(
             instance.daemon_cursor_storage, _SENSOR_NAME
         )
-        assert key_states["orders"].error_count == 0
+        assert key_states.get("orders", GuardState()).error_count == 0
 
     def test_success_decays_key_decay_strategy(self, instance):
         """Success on a key decays that key's counter with DECAY strategy."""
@@ -246,7 +246,7 @@ class TestPerKeyReset:
             instance.daemon_cursor_storage, _SENSOR_NAME
         )
         assert key_states["orders"].error_count == 3
-        assert key_states["customers"].error_count == 0  # reset
+        assert key_states.get("customers", GuardState()).error_count == 0  # reset
 
 
 class TestPerKeyStatePersistence:

@@ -3,8 +3,6 @@
 import time
 from unittest.mock import patch
 
-from dagster import DagsterInstance
-
 from dagster_sensor_guard.state import (
     GuardState,
     apply_reset,

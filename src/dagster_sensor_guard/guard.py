@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, Dict, Optional
 
 from dagster_sensor_guard.state import (
     GuardState,

@@ -8,7 +8,6 @@ from dagster import (
     AddDynamicPartitionsRequest,
     AssetKey,
     AssetMaterialization,
-    DagsterInstance,
     RunRequest,
     SensorResult,
     SkipReason,

@@ -60,7 +60,7 @@ def load_guard_state(daemon_cursor_storage: object, sensor_name: str) -> GuardSt
         return GuardState()
     try:
         return GuardState.from_dict(json.loads(raw))
-    except (json.JSONDecodeError, TypeError, KeyError):
+    except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
         return GuardState()
 
 
@@ -70,7 +70,6 @@ def save_guard_state(
     """Persist guard state to KVS."""
     key = kvs_key(sensor_name)
     daemon_cursor_storage.set_cursor_values({key: json.dumps(state.to_dict())})
-
 
 
 def increment_error(
@@ -153,7 +152,11 @@ def save_all_key_states(
     sensor_name: str,
     key_states: Dict[str, GuardState],
 ) -> None:
-    """Persist all per-key guard states to KVS in a single write."""
+    """Persist all per-key guard states to KVS in a single write.
+
+    Keys with default (zeroed) state are pruned to prevent unbounded growth.
+    """
     key = kvs_keys_key(sensor_name)
-    data = {k: v.to_dict() for k, v in key_states.items()}
+    active = {k: v for k, v in key_states.items() if v != GuardState()}
+    data = {k: v.to_dict() for k, v in active.items()}
     daemon_cursor_storage.set_cursor_values({key: json.dumps(data)})

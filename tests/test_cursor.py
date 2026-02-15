@@ -6,7 +6,7 @@ Guard state lives in daemon_cursor_storage, completely separate.
 
 import json
 
-from dagster import DagsterInstance, SkipReason, build_sensor_context, sensor
+from dagster import SkipReason, build_sensor_context, sensor
 
 from dagster_sensor_guard import resilient_sensor
 from dagster_sensor_guard.state import load_guard_state
