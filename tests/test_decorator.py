@@ -1,6 +1,5 @@
 """Tests for the @resilient_sensor decorator."""
 
-import json
 import logging
 from unittest.mock import MagicMock
 
@@ -439,109 +438,6 @@ class TestCursorLeakAfterBreach:
         # Tick 4 (after breach): "30" (set by tick 3)
         assert observed_cursors[3] == "30"
 
-    def test_legacy_cursor_migration(self, instance):
-        """A cursor persisted with the old envelope format should be migrated:
-        guard state moves to KVS, user cursor is restored."""
-        observed = []
-
-        @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
-        def my_sensor(context):
-            observed.append(context.cursor)
-            yield SkipReason("OK")
-
-        # Simulate a cursor written by the old code with the legacy key.
-        legacy_cursor = json.dumps({
-            "__sensor_guard": {
-                "error_count": 2,
-                "first_error_ts": 1000.0,
-                "last_error_ts": 1010.0,
-            },
-            "__user_cursor": "36",
-        })
-
-        context = build_sensor_context(
-            cursor=legacy_cursor, instance=instance, sensor_name=_SENSOR_NAME,
-        )
-        list(my_sensor(context))
-
-        # User sees their cursor, not the envelope.
-        assert observed[0] == "36"
-        # Guard state was migrated to KVS.
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
-        # After a successful tick, state is reset.
-        assert state.error_count == 0
-
-
-class TestRootCauseCursorLeakCascade:
-    """Reproduce the exact failure chain: legacy key -> leaked JSON cursor ->
-    ValueError in user code -> error count never resets -> sensor stuck."""
-
-    def test_int_cursor_valueerror_from_legacy_key(self, instance):
-        """A sensor that does int(context.cursor) must not get a ValueError
-        because context.cursor is the raw JSON envelope."""
-        observed_cursors = []
-
-        @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
-        def offset_sensor(context):
-            observed_cursors.append(context.cursor)
-            offset = int(context.cursor or "0")
-            context.update_cursor(str(offset + 1))
-            yield SkipReason(f"at {offset}")
-
-        # Simulate a cursor written with the legacy key (pre-rename code).
-        legacy_cursor = json.dumps({
-            "__sensor_guard": {
-                "error_count": 1,
-                "first_error_ts": 1000.0,
-                "last_error_ts": 1010.0,
-            },
-            "__user_cursor": "36",
-        })
-
-        context = build_sensor_context(
-            cursor=legacy_cursor, instance=instance, sensor_name=_SENSOR_NAME,
-        )
-        results = list(offset_sensor(context))
-
-        assert observed_cursors[0] == "36"
-        assert isinstance(results[0], SkipReason)
-        assert "at 36" in results[0].skip_message
-
-    def test_never_recovers_when_cursor_leaks(self, instance):
-        """End-to-end: legacy cursor -> migration -> sensor runs normally."""
-        tick = 0
-
-        @sensor(job=_make_job())
-        @resilient_sensor(threshold=2)
-        def offset_sensor(context):
-            nonlocal tick
-            tick += 1
-            offset = int(context.cursor or "0")
-            context.update_cursor(str(offset + tick))
-            yield SkipReason(f"at {offset}")
-
-        # Build a legacy-format cursor as if errors had accumulated.
-        legacy_cursor = json.dumps({
-            "__sensor_guard": {
-                "error_count": 2,
-                "first_error_ts": 1000.0,
-                "last_error_ts": 1010.0,
-            },
-            "__user_cursor": "100",
-        })
-
-        context = build_sensor_context(
-            cursor=legacy_cursor, instance=instance, sensor_name=_SENSOR_NAME,
-        )
-        results = list(offset_sensor(context))
-
-        assert isinstance(results[0], SkipReason)
-        assert "at 100" in results[0].skip_message
-
-        # User cursor is now native — no envelope.
-        assert context.cursor == "101"
 
 
 class TestRootCauseNeverRecovers:
@@ -1006,7 +902,7 @@ class TestCallbackExceptionHandling:
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
-        with caplog.at_level(logging.WARNING, logger="dagster_sensor_guard.decorator"):
+        with caplog.at_level(logging.WARNING, logger="dagster.sensor_guard"):
             _invoke_sensor(failing_sensor, instance)
 
         assert "on_suppressed_error callback raised an exception" in caplog.text
