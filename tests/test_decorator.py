@@ -243,6 +243,48 @@ class TestDecayReset:
 
         assert counts == [1, 0, 1, 2, 1]
 
+    def test_decay_preserves_count_after_breach(self, instance):
+        """With decay strategy, breach preserves the count so subsequent
+        failures continue to breach until successes decay it down."""
+        # F F F F(breach) F(breach) S F(breach) S S
+        script = [False, False, False, False, False, True, False, True, True]
+        tick = 0
+
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=3, reset_strategy="decay", decay_amount=1)
+        def decay_sensor(context):
+            nonlocal tick
+            idx = tick
+            tick += 1
+            if not script[idx]:
+                raise ConnectionError("down")
+            yield SkipReason("OK")
+
+        cursor = None
+        counts = []
+        for succeeds in script:
+            context = build_sensor_context(
+                cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
+            )
+            try:
+                list(decay_sensor(context))
+            except ConnectionError:
+                pass
+            cursor = context.cursor
+            state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+            counts.append(state.error_count)
+
+        # Tick 1: fail → 1 (suppressed)
+        # Tick 2: fail → 2 (suppressed)
+        # Tick 3: fail → 3 (suppressed)
+        # Tick 4: fail → 4 (breach, count preserved)
+        # Tick 5: fail → 5 (breach again, count preserved)
+        # Tick 6: succeed → decay 5→4
+        # Tick 7: fail → 5 (breach, count preserved)
+        # Tick 8: succeed → decay 5→4
+        # Tick 9: succeed → decay 4→3
+        assert counts == [1, 2, 3, 4, 5, 4, 5, 4, 3]
+
 
 class TestRecoveryAfterBreach:
     def test_success_after_threshold_breach_resets_counter(self, instance):

@@ -131,8 +131,13 @@ def resilient_sensor(
                 guard_state = increment_error(guard_state, window_minutes)
 
                 if should_raise(guard_state, threshold):
-                    # Reset for recovery on the next tick.
-                    save_guard_state(storage, sensor_name, GuardState())
+                    if reset_enum == ResetStrategy.FULL:
+                        # Full reset: give the sensor fresh retries.
+                        save_guard_state(storage, sensor_name, GuardState())
+                    else:
+                        # Decay: preserve the count so subsequent failures
+                        # continue to breach until successes decay it down.
+                        save_guard_state(storage, sensor_name, guard_state)
                     raise
 
                 # Persist the incremented error count.
