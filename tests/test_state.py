@@ -1,6 +1,5 @@
 """Tests for state management and KVS storage."""
 
-import json
 import time
 from unittest.mock import patch
 
@@ -9,7 +8,6 @@ from dagster import DagsterInstance
 from dagster_sensor_guard.state import (
     GuardState,
     apply_reset,
-    detect_envelope_cursor,
     increment_error,
     kvs_key,
     kvs_keys_key,
@@ -65,54 +63,6 @@ class TestSaveGuardState:
         loaded = load_guard_state(storage, "test")
         assert loaded.error_count == 5
 
-
-class TestDetectEnvelopeCursor:
-    def test_none_cursor(self):
-        assert detect_envelope_cursor(None) is None
-
-    def test_plain_string(self):
-        assert detect_envelope_cursor("my_offset_123") is None
-
-    def test_json_without_guard_key(self):
-        raw = json.dumps({"offset": 42, "batch": "abc"})
-        assert detect_envelope_cursor(raw) is None
-
-    def test_v1_envelope(self):
-        raw = json.dumps({
-            "__dagster_sensor_guard_v1": {"error_count": 3, "first_error_ts": 1000.0, "last_error_ts": 1010.0},
-            "__user_cursor": "user_data",
-        })
-        result = detect_envelope_cursor(raw)
-        assert result is not None
-        state, user_cursor = result
-        assert state.error_count == 3
-        assert state.first_error_ts == 1000.0
-        assert user_cursor == "user_data"
-
-    def test_legacy_envelope(self):
-        raw = json.dumps({
-            "__sensor_guard": {"error_count": 2, "first_error_ts": 500.0, "last_error_ts": 600.0},
-            "__user_cursor": "36",
-        })
-        result = detect_envelope_cursor(raw)
-        assert result is not None
-        state, user_cursor = result
-        assert state.error_count == 2
-        assert user_cursor == "36"
-
-    def test_envelope_with_none_user_cursor(self):
-        raw = json.dumps({
-            "__dagster_sensor_guard_v1": {"error_count": 1},
-            "__user_cursor": None,
-        })
-        result = detect_envelope_cursor(raw)
-        assert result is not None
-        state, user_cursor = result
-        assert state.error_count == 1
-        assert user_cursor is None
-
-    def test_json_array_not_detected(self):
-        assert detect_envelope_cursor("[1, 2, 3]") is None
 
 
 class TestIncrementError:

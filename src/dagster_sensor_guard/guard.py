@@ -16,7 +16,7 @@ from dagster_sensor_guard.state import (
 )
 from dagster_sensor_guard.types import ResetStrategy
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("dagster.sensor_guard")
 
 
 class SensorGuardKeyError(Exception):
@@ -67,11 +67,23 @@ class SensorGuard:
             storage, sensor_name
         )
         self._breached_keys: Dict[str, Exception] = {}
+        self._succeeded_keys: list[str] = []
+        self._suppressed_keys: list[str] = []
 
     @property
     def breached_keys(self) -> Dict[str, Exception]:
         """Keys whose error count exceeded the threshold during this tick."""
         return dict(self._breached_keys)
+
+    @property
+    def succeeded_keys(self) -> list[str]:
+        """Keys that succeeded during this tick."""
+        return list(self._succeeded_keys)
+
+    @property
+    def suppressed_keys(self) -> list[str]:
+        """Keys whose errors were suppressed during this tick."""
+        return list(self._suppressed_keys)
 
     @contextmanager
     def track(self, key: str):
@@ -90,6 +102,10 @@ class SensorGuard:
             if should_raise(state, self._threshold):
                 # Breached — collect but don't raise yet (process remaining keys).
                 self._breached_keys[key] = exc
+                logger.info(
+                    "[%s] key '%s': error exceeded threshold (%d/%d) - %s",
+                    self._sensor_name, key, state.error_count, self._threshold, exc,
+                )
                 if self._reset_strategy == ResetStrategy.FULL:
                     state = GuardState()
                 # For DECAY, preserve count so subsequent ticks keep breaching.
@@ -97,6 +113,11 @@ class SensorGuard:
             else:
                 # Below threshold — suppress.
                 self._key_states[key] = state
+                self._suppressed_keys.append(key)
+                logger.info(
+                    "[%s] key '%s': error suppressed (%d/%d) - %s",
+                    self._sensor_name, key, state.error_count, self._threshold, exc,
+                )
                 if self._on_suppressed_error is not None:
                     try:
                         self._on_suppressed_error(
@@ -112,6 +133,8 @@ class SensorGuard:
             state = self._key_states.get(key, GuardState())
             state = apply_reset(state, self._reset_strategy, self._decay_amount)
             self._key_states[key] = state
+            self._succeeded_keys.append(key)
+            logger.info("[%s] key '%s': ok", self._sensor_name, key)
 
     def save(self) -> None:
         """Batch-write all per-key states to KVS (one write)."""

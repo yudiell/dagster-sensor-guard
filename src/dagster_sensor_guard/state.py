@@ -10,16 +10,11 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional
 
 from dagster_sensor_guard.types import ResetStrategy
 
 _KVS_KEY_PREFIX = "dagster_sensor_guard"
-
-# Legacy envelope keys — only used for migration detection.
-_ENVELOPE_KEY_V1 = "__dagster_sensor_guard_v1"
-_ENVELOPE_KEY_LEGACY = "__sensor_guard"
-_USER_KEY = "__user_cursor"
 
 
 @dataclass(frozen=True)
@@ -76,36 +71,6 @@ def save_guard_state(
     key = kvs_key(sensor_name)
     daemon_cursor_storage.set_cursor_values({key: json.dumps(state.to_dict())})
 
-
-def detect_envelope_cursor(
-    raw_cursor: Optional[str],
-) -> Optional[Tuple[GuardState, Optional[str]]]:
-    """Detect old envelope format in cursor.
-
-    Returns (guard_state, user_cursor) if the cursor contains an old-style
-    envelope, or None if it's a plain user cursor.
-    """
-    if raw_cursor is None:
-        return None
-
-    try:
-        data = json.loads(raw_cursor)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-    if not isinstance(data, dict):
-        return None
-
-    if _ENVELOPE_KEY_V1 in data:
-        guard_data = data[_ENVELOPE_KEY_V1]
-    elif _ENVELOPE_KEY_LEGACY in data:
-        guard_data = data[_ENVELOPE_KEY_LEGACY]
-    else:
-        return None
-
-    guard_state = GuardState.from_dict(guard_data)
-    user_cursor = data.get(_USER_KEY)
-    return guard_state, user_cursor
 
 
 def increment_error(

@@ -1,5 +1,6 @@
 """Tests for per-key failure tracking (per_key=True)."""
 
+import logging
 import time
 from unittest.mock import MagicMock, patch
 
@@ -579,3 +580,82 @@ class TestPerKeyWindow:
         assert key_states["orders"].error_count == 1
         # customers: window still active → count 2.
         assert key_states["customers"].error_count == 2
+
+
+class TestPerKeyLogging:
+    def test_suppressed_keys_logged_at_info(self, instance, caplog):
+        """Suppressed per-key errors are logged at INFO level."""
+
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=3, per_key=True)
+        def multi_sensor(context, guard):
+            for table in ["orders", "customers"]:
+                with guard.track(table):
+                    raise ConnectionError(f"{table} down")
+
+        with caplog.at_level(logging.INFO, logger="dagster.sensor_guard"):
+            _invoke_sensor(multi_sensor, instance)
+
+        info_messages = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any("key 'orders': error suppressed (1/3)" in m for m in info_messages)
+        assert any("key 'customers': error suppressed (1/3)" in m for m in info_messages)
+
+    def test_success_keys_logged_at_info(self, instance, caplog):
+        """Successful per-key outcomes are logged at INFO level."""
+
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=3, per_key=True)
+        def multi_sensor(context, guard):
+            with guard.track("orders"):
+                pass  # success
+
+        with caplog.at_level(logging.INFO, logger="dagster.sensor_guard"):
+            _invoke_sensor(multi_sensor, instance)
+
+        info_messages = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any("key 'orders': ok" in m for m in info_messages)
+
+    def test_tick_summary_logged_at_warning(self, instance, caplog):
+        """Tick summary is logged at WARNING level."""
+
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=3, per_key=True)
+        def multi_sensor(context, guard):
+            for table in ["orders", "customers", "inventory"]:
+                with guard.track(table):
+                    if table == "customers":
+                        raise ConnectionError(f"{table} down")
+
+        with caplog.at_level(logging.WARNING, logger="dagster.sensor_guard"):
+            _invoke_sensor(multi_sensor, instance)
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("tick summary: 2 ok, 1 suppressed, 0 breached" in m for m in warning_messages)
+
+    def test_tick_summary_includes_breached_keys(self, instance, caplog):
+        """Tick summary lists breached key names when present."""
+        tick = 0
+
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=1, per_key=True)
+        def multi_sensor(context, guard):
+            nonlocal tick
+            tick += 1
+            for table in ["orders", "customers", "inventory"]:
+                with guard.track(table):
+                    if table == "inventory":
+                        raise ConnectionError(f"{table} down")
+
+        # Tick 1: inventory suppressed.
+        _invoke_sensor(multi_sensor, instance)
+
+        # Tick 2: inventory breaches.
+        with caplog.at_level(logging.WARNING, logger="dagster.sensor_guard"):
+            with pytest.raises(SensorGuardKeyError):
+                _invoke_sensor(multi_sensor, instance)
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "tick summary: 2 ok, 0 suppressed, 1 breached [inventory]" in m
+            for m in warning_messages
+        )

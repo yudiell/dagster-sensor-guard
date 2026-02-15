@@ -3,9 +3,6 @@
 Guard state is stored in Dagster's daemon_cursor_storage (KVS), completely
 decoupled from the user's sensor cursor. The user's cursor flows through
 Dagster natively, untouched.
-
-Migration: On the first tick after upgrade, any old envelope-format cursor
-is detected, guard state is moved to KVS, and the user's cursor is restored.
 """
 
 from __future__ import annotations
@@ -21,7 +18,6 @@ from dagster_sensor_guard.guard import SensorGuard, SensorGuardKeyError
 from dagster_sensor_guard.state import (
     GuardState,
     apply_reset,
-    detect_envelope_cursor,
     increment_error,
     load_guard_state,
     save_guard_state,
@@ -29,7 +25,7 @@ from dagster_sensor_guard.state import (
 )
 from dagster_sensor_guard.types import ResetStrategy
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("dagster.sensor_guard")
 
 
 def resilient_sensor(
@@ -115,13 +111,6 @@ def resilient_sensor(
             storage = context.instance.daemon_cursor_storage
             sensor_name = context.sensor_name
 
-            # --- One-time migration from envelope cursor ---
-            envelope = detect_envelope_cursor(context.cursor)
-            if envelope is not None:
-                old_guard_state, user_cursor = envelope
-                save_guard_state(storage, sensor_name, old_guard_state)
-                context.update_cursor(user_cursor)
-
             # --- Load guard state from KVS ---
             guard_state = load_guard_state(storage, sensor_name)
 
@@ -197,6 +186,15 @@ def resilient_sensor(
                 guard.save()
                 guard_state = apply_reset(guard_state, reset_enum, decay_amount)
                 save_guard_state(storage, sensor_name, guard_state)
+
+                logger.warning(
+                    "[%s] tick summary: %d ok, %d suppressed, %d breached%s",
+                    sensor_name,
+                    len(guard.succeeded_keys),
+                    len(guard.suppressed_keys),
+                    len(guard.breached_keys),
+                    f" [{', '.join(sorted(guard.breached_keys))}]" if guard.breached_keys else "",
+                )
 
                 # Raise after full iteration if any keys breached.
                 if guard.breached_keys:
