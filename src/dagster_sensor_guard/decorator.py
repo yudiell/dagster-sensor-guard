@@ -17,6 +17,7 @@ from typing import Callable, Optional, Union
 
 from dagster import RunRequest, SensorDefinition, SensorEvaluationContext, SensorResult, SkipReason
 
+from dagster_sensor_guard.guard import SensorGuard, SensorGuardKeyError
 from dagster_sensor_guard.state import (
     GuardState,
     apply_reset,
@@ -37,6 +38,7 @@ def resilient_sensor(
     reset_strategy: Union[str, ResetStrategy] = ResetStrategy.FULL,
     decay_amount: int = 1,
     on_suppressed_error: Optional[Callable[[Exception, int, int], None]] = None,
+    per_key: bool = False,
 ) -> Callable:
     """Decorator that adds error tolerance to a Dagster sensor.
 
@@ -47,6 +49,16 @@ def resilient_sensor(
         @resilient_sensor(threshold=3)
         def my_sensor(context):
             ...
+
+    For sensors that iterate over multiple independent resources, use
+    ``per_key=True`` to track failures independently per key:
+
+        @sensor(job=my_job)
+        @resilient_sensor(threshold=3, per_key=True)
+        def my_sensor(context, guard):
+            for table in ["orders", "customers"]:
+                with guard.track(table):
+                    ...
 
     Args:
         threshold: Number of consecutive errors to tolerate before raising.
@@ -62,6 +74,8 @@ def resilient_sensor(
             (only used with reset_strategy="decay").
         on_suppressed_error: Optional callback invoked each time an error is
             suppressed. Signature: (error, current_count, threshold) -> None.
+        per_key: When True, a SensorGuard is injected as the second parameter
+            for independent per-key failure tracking. Defaults to False.
     """
     if threshold < 1:
         raise ValueError(f"threshold must be >= 1, got {threshold}")
@@ -88,6 +102,15 @@ def resilient_sensor(
                 "Use a synchronous function instead."
             )
 
+        if per_key:
+            sig = inspect.signature(fn)
+            if len(sig.parameters) < 2:
+                raise TypeError(
+                    "per_key=True requires the sensor function to accept a "
+                    "second parameter for the SensorGuard, e.g.:\n"
+                    "    def my_sensor(context, guard): ..."
+                )
+
         def wrapped_fn(context: SensorEvaluationContext):
             storage = context.instance.daemon_cursor_storage
             sensor_name = context.sensor_name
@@ -102,6 +125,86 @@ def resilient_sensor(
             # --- Load guard state from KVS ---
             guard_state = load_guard_state(storage, sensor_name)
 
+            # --- per_key=True: delegate per-key tracking to SensorGuard ---
+            if per_key:
+                guard = SensorGuard(
+                    storage=storage,
+                    sensor_name=sensor_name,
+                    threshold=threshold,
+                    window_minutes=window_minutes,
+                    reset_strategy=reset_enum,
+                    decay_amount=decay_amount,
+                    on_suppressed_error=on_suppressed_error,
+                )
+
+                has_run_request = False
+
+                try:
+                    result = fn(context, guard)
+
+                    if inspect.isgenerator(result):
+                        for item in result:
+                            if isinstance(item, RunRequest):
+                                has_run_request = True
+                            yield item
+                    elif isinstance(result, SensorResult):
+                        if result.run_requests:
+                            has_run_request = True
+                        yield result
+                    elif isinstance(result, (list, tuple)):
+                        for item in result:
+                            if isinstance(item, RunRequest):
+                                has_run_request = True
+                            yield item
+                    elif result is not None:
+                        if isinstance(result, RunRequest):
+                            has_run_request = True
+                        yield result
+
+                except Exception as exc:
+                    # Exception outside guard.track() — sensor-level tracking.
+                    guard.save()
+                    guard_state = increment_error(guard_state, window_minutes)
+
+                    if should_raise(guard_state, threshold):
+                        if reset_enum == ResetStrategy.FULL:
+                            save_guard_state(storage, sensor_name, GuardState())
+                        else:
+                            save_guard_state(storage, sensor_name, guard_state)
+                        raise
+
+                    save_guard_state(storage, sensor_name, guard_state)
+
+                    if on_suppressed_error is not None:
+                        try:
+                            on_suppressed_error(
+                                exc, guard_state.error_count, threshold
+                            )
+                        except Exception:
+                            logger.warning(
+                                "on_suppressed_error callback raised an exception",
+                                exc_info=True,
+                            )
+
+                    if not has_run_request:
+                        yield SkipReason(
+                            f"Suppressed transient error "
+                            f"({guard_state.error_count}/{threshold}): {exc}"
+                        )
+                    return
+
+                # per_key success path: save per-key state and sensor-level state.
+                guard.save()
+                guard_state = apply_reset(guard_state, reset_enum, decay_amount)
+                save_guard_state(storage, sensor_name, guard_state)
+
+                # Raise after full iteration if any keys breached.
+                if guard.breached_keys:
+                    raise SensorGuardKeyError(guard.breached_keys)
+
+                return
+
+            # --- per_key=False: original code path (unchanged) ---
             has_run_request = False
 
             try:

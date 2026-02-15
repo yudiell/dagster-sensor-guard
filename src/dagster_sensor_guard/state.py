@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple
 
 from dagster_sensor_guard.types import ResetStrategy
 
@@ -49,6 +49,11 @@ class GuardState:
 def kvs_key(sensor_name: str) -> str:
     """Build the KVS key for a sensor's guard state."""
     return f"{_KVS_KEY_PREFIX}:{sensor_name}"
+
+
+def kvs_keys_key(sensor_name: str) -> str:
+    """Build the KVS key for a sensor's per-key guard states."""
+    return f"{_KVS_KEY_PREFIX}:{sensor_name}:keys"
 
 
 def load_guard_state(daemon_cursor_storage: object, sensor_name: str) -> GuardState:
@@ -160,3 +165,30 @@ def should_raise(
     function is called the state already reflects any window-based reset.
     """
     return state.error_count > threshold
+
+
+def load_all_key_states(
+    daemon_cursor_storage: object, sensor_name: str
+) -> Dict[str, GuardState]:
+    """Load all per-key guard states from KVS. Returns empty dict if not found."""
+    key = kvs_keys_key(sensor_name)
+    values: Mapping[str, str] = daemon_cursor_storage.get_cursor_values({key})
+    raw = values.get(key)
+    if raw is None:
+        return {}
+    try:
+        data = json.loads(raw)
+        return {k: GuardState.from_dict(v) for k, v in data.items()}
+    except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
+        return {}
+
+
+def save_all_key_states(
+    daemon_cursor_storage: object,
+    sensor_name: str,
+    key_states: Dict[str, GuardState],
+) -> None:
+    """Persist all per-key guard states to KVS in a single write."""
+    key = kvs_keys_key(sensor_name)
+    data = {k: v.to_dict() for k, v in key_states.items()}
+    daemon_cursor_storage.set_cursor_values({key: json.dumps(data)})

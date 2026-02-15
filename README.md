@@ -46,6 +46,7 @@ All parameters are **optional** and have defaults. There are no required paramet
 | `reset_strategy` | `str` | `"full"` | `"full"` or `"decay"`. Determines how success resets the error count. See below. |
 | `decay_amount` | `int` | `1` | How much to subtract from the error count per successful tick. **Only used when `reset_strategy="decay"`**. |
 | `on_suppressed_error` | `Callable` | `None` | Optional callback invoked each time an error is suppressed. Signature: `(error: Exception, count: int, threshold: int) -> None`. |
+| `per_key` | `bool` | `False` | When `True`, a `SensorGuard` is injected as the second parameter for independent per-key failure tracking. See [Per-Key Failure Tracking](#per-key-failure-tracking). |
 
 ## Consecutive count vs. time window
 
@@ -124,6 +125,69 @@ Each success decrements the count by `decay_amount` instead of clearing it. Usef
 )
 def my_sensor(context):
     ...
+```
+
+## Per-Key Failure Tracking
+
+For sensors that iterate over multiple independent resources (tables, buckets, APIs), a single failure normally kills the entire tick. With `per_key=True`, each resource is tracked independently — one failing key doesn't block the others.
+
+```python
+from dagster import sensor, RunRequest
+from dagster_sensor_guard import resilient_sensor
+
+@sensor(job=my_job)
+@resilient_sensor(threshold=3, per_key=True)
+def multi_table_sensor(context, guard):
+    for table in ["orders", "customers", "inventory"]:
+        with guard.track(table):
+            max_ts = query_table(table)
+            if has_new_data(table, max_ts):
+                yield RunRequest(run_key=f"{table}_{max_ts}")
+```
+
+When `per_key=True`, a `SensorGuard` is injected as the second parameter. Wrap each independent unit of work with `guard.track(key)`:
+
+- **Success** resets that key's error counter (respecting `reset_strategy`)
+- **Error below threshold** is suppressed for that key; the loop continues to the next key
+- **Error at threshold** collects the key; after all keys are processed, a `SensorGuardKeyError` is raised containing all breached keys
+
+RunRequests from healthy keys are yielded even when other keys fail. All keys are always processed before any breach surfaces.
+
+### Handling breached keys
+
+```python
+from dagster_sensor_guard import SensorGuardKeyError
+
+try:
+    list(my_sensor(context))
+except SensorGuardKeyError as e:
+    print(e.breached_keys)  # {"orders": ConnectionError(...), "inventory": TimeoutError(...)}
+```
+
+### Errors outside `guard.track()`
+
+Exceptions raised outside a `guard.track()` block fall back to the sensor-level tracking (the same behavior as `per_key=False`).
+
+### All parameters work with per-key
+
+`window_minutes`, `reset_strategy`, `decay_amount`, and `on_suppressed_error` all apply independently per key:
+
+```python
+@sensor(job=my_job)
+@resilient_sensor(
+    threshold=5,
+    per_key=True,
+    reset_strategy="decay",
+    decay_amount=1,
+    window_minutes=30,
+    on_suppressed_error=lambda err, count, threshold: logger.warning(
+        f"Key error suppressed ({count}/{threshold}): {err}"
+    ),
+)
+def my_sensor(context, guard):
+    for table in tables:
+        with guard.track(table):
+            ...
 ```
 
 ## Suppressed error callback
