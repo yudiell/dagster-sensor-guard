@@ -217,7 +217,28 @@ def my_sensor(context):
     context.update_cursor(str(new_offset))
 ```
 
-`context.cursor` is always your value — no JSON envelope, no hidden state. `context.update_cursor()` works as expected. The Dagster UI shows your cursor, not guard internals.
+`context.cursor` is always your value. `context.update_cursor()` works as expected. The Dagster UI shows your cursor, not guard internals.
+
+## Logging
+
+When using `per_key=True`, the decorator logs a tick summary at **WARNING** level after each tick so it's always visible in the `dagster dev` console:
+
+```
+dagster.sensor_guard - WARNING - [multi_table_sensor] tick summary: 2 ok, 1 suppressed, 0 breached
+dagster.sensor_guard - WARNING - [multi_table_sensor] tick summary: 2 ok, 0 suppressed, 1 breached [inventory]
+```
+
+Per-key outcomes (ok, suppressed, breached) are logged at **INFO** level. To see them in `dagster dev`, raise the code server log level:
+
+```bash
+dagster dev --code-server-log-level info
+```
+
+```
+dagster.sensor_guard - INFO - [multi_table_sensor] key 'orders': ok
+dagster.sensor_guard - INFO - [multi_table_sensor] key 'customers': error suppressed (1/3) - Connection timed out
+dagster.sensor_guard - INFO - [multi_table_sensor] key 'inventory': error exceeded threshold (4/3) - Connection timed out
+```
 
 ## License
 
