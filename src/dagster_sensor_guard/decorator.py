@@ -16,8 +16,8 @@ Implementation notes (from Dagster source investigation):
   (check.failed in evaluate_tick). We track whether RunRequests were yielded
   and skip the SkipReason if so.
 
-- We manipulate context._cursor directly before/after calling the user's
-  function to transparently namespace guard state alongside user cursor data.
+- We use context.update_cursor() before/after calling the user's function
+  to transparently namespace guard state alongside user cursor data.
 """
 
 from __future__ import annotations
@@ -105,7 +105,9 @@ def resilient_sensor(
             guard_state, user_cursor = parse_cursor(raw_cursor)
 
             # Expose only the user's cursor to the sensor function.
-            context._cursor = user_cursor  # noqa: SLF001
+            # Use the public API rather than touching context._cursor directly,
+            # which breaks across Dagster versions.
+            context.update_cursor(user_cursor)
 
             has_run_request = False
 
