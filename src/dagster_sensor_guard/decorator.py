@@ -23,15 +23,27 @@ from dagster_sensor_guard.state import (
     save_guard_state,
     should_raise,
 )
-from dagster_sensor_guard.types import ResetStrategy
+from dagster_sensor_guard.types import CursorStorage, ResetStrategy
 
 logger = logging.getLogger("dagster.sensor_guard")
+
+
+def _dispatch_result(result):
+    """Yield items from a sensor function's return value."""
+    if inspect.isgenerator(result):
+        yield from result
+    elif isinstance(result, SensorResult):
+        yield result
+    elif isinstance(result, (list, tuple)):
+        yield from result
+    elif result is not None:
+        yield result
 
 
 def _handle_sensor_error(
     exc: Exception,
     guard_state: GuardState,
-    storage: object,
+    storage: CursorStorage,
     sensor_name: str,
     window_minutes: Optional[int],
     threshold: int,
@@ -178,24 +190,10 @@ def resilient_sensor(
                 try:
                     result = fn(context, guard)
 
-                    if inspect.isgenerator(result):
-                        for item in result:
-                            if isinstance(item, RunRequest):
-                                has_run_request = True
-                            yield item
-                    elif isinstance(result, SensorResult):
-                        if result.run_requests:
+                    for item in _dispatch_result(result):
+                        if isinstance(item, RunRequest):
                             has_run_request = True
-                        yield result
-                    elif isinstance(result, (list, tuple)):
-                        for item in result:
-                            if isinstance(item, RunRequest):
-                                has_run_request = True
-                            yield item
-                    elif result is not None:
-                        if isinstance(result, RunRequest):
-                            has_run_request = True
-                        yield result
+                        yield item
 
                 except Exception as exc:
                     # Exception outside guard.track() — sensor-level tracking.
@@ -236,24 +234,10 @@ def resilient_sensor(
             try:
                 result = fn(context)
 
-                if inspect.isgenerator(result):
-                    for item in result:
-                        if isinstance(item, RunRequest):
-                            has_run_request = True
-                        yield item
-                elif isinstance(result, SensorResult):
-                    if result.run_requests:
+                for item in _dispatch_result(result):
+                    if isinstance(item, RunRequest):
                         has_run_request = True
-                    yield result
-                elif isinstance(result, (list, tuple)):
-                    for item in result:
-                        if isinstance(item, RunRequest):
-                            has_run_request = True
-                        yield item
-                elif result is not None:
-                    if isinstance(result, RunRequest):
-                        has_run_request = True
-                    yield result
+                    yield item
 
             except Exception as exc:
                 guard_state, reraise, skip = _handle_sensor_error(

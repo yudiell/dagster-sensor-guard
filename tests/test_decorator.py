@@ -438,7 +438,6 @@ class TestCursorLeakAfterBreach:
         assert observed_cursors[3] == "30"
 
 
-
 class TestRootCauseNeverRecovers:
     """With KVS storage, the 'never recovers' bug is eliminated because
     guard state persists independently of Dagster's cursor."""

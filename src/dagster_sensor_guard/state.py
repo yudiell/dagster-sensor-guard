@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Mapping, Optional
 
-from dagster_sensor_guard.types import ResetStrategy
+from dagster_sensor_guard.types import CursorStorage, ResetStrategy
 
 _KVS_KEY_PREFIX = "dagster_sensor_guard"
 
@@ -51,7 +51,7 @@ def kvs_keys_key(sensor_name: str) -> str:
     return f"{_KVS_KEY_PREFIX}:{sensor_name}:keys"
 
 
-def load_guard_state(daemon_cursor_storage: object, sensor_name: str) -> GuardState:
+def load_guard_state(daemon_cursor_storage: CursorStorage, sensor_name: str) -> GuardState:
     """Load guard state from KVS. Returns default GuardState if not found."""
     key = kvs_key(sensor_name)
     values: Mapping[str, str] = daemon_cursor_storage.get_cursor_values({key})
@@ -65,7 +65,7 @@ def load_guard_state(daemon_cursor_storage: object, sensor_name: str) -> GuardSt
 
 
 def save_guard_state(
-    daemon_cursor_storage: object, sensor_name: str, state: GuardState
+    daemon_cursor_storage: CursorStorage, sensor_name: str, state: GuardState
 ) -> None:
     """Persist guard state to KVS."""
     key = kvs_key(sensor_name)
@@ -132,7 +132,7 @@ def should_raise(
 
 
 def load_all_key_states(
-    daemon_cursor_storage: object, sensor_name: str
+    daemon_cursor_storage: CursorStorage, sensor_name: str
 ) -> Dict[str, GuardState]:
     """Load all per-key guard states from KVS. Returns empty dict if not found."""
     key = kvs_keys_key(sensor_name)
@@ -148,7 +148,7 @@ def load_all_key_states(
 
 
 def save_all_key_states(
-    daemon_cursor_storage: object,
+    daemon_cursor_storage: CursorStorage,
     sensor_name: str,
     key_states: Dict[str, GuardState],
 ) -> None:

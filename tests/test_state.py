@@ -62,7 +62,6 @@ class TestSaveGuardState:
         assert loaded.error_count == 5
 
 
-
 class TestIncrementError:
     def test_first_error(self):
         state = GuardState()
