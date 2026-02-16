@@ -1,5 +1,6 @@
 """Tests for SqliteGuardStorage."""
 
+import threading
 import time
 from unittest.mock import patch
 
@@ -97,6 +98,47 @@ class TestFilePersistence:
         s2 = SqliteGuardStorage(db_path=path)
         assert s2.get_cursor_values({"key"}) == {"key": "value"}
         s2.close()
+
+
+class TestThreadSafety:
+    def test_concurrent_writes_from_multiple_threads(self, tmp_path):
+        path = str(tmp_path / "thread_test.db")
+        s = SqliteGuardStorage(db_path=path)
+        errors = []
+
+        def writer(thread_id):
+            try:
+                for i in range(10):
+                    s.set_cursor_values({f"t{thread_id}_k{i}": f"v{i}"})
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(t,)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Thread errors: {errors}"
+        # Each of 4 threads wrote 10 keys.
+        result = s.get_cursor_values({f"t{t}_k{i}" for t in range(4) for i in range(10)})
+        assert len(result) == 40
+
+    def test_read_from_different_thread_than_write(self, tmp_path):
+        path = str(tmp_path / "thread_test.db")
+        s = SqliteGuardStorage(db_path=path)
+        s.set_cursor_values({"main_key": "main_value"})
+
+        result = {}
+
+        def reader():
+            result.update(s.get_cursor_values({"main_key"}))
+
+        t = threading.Thread(target=reader)
+        t.start()
+        t.join()
+
+        assert result == {"main_key": "main_value"}
 
 
 class TestProtocolCompliance:
