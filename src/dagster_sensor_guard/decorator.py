@@ -220,7 +220,9 @@ def resilient_sensor(
                     result = fn(**fn_kwargs)
 
                     for item in _dispatch_result(result):
-                        if isinstance(item, RunRequest):
+                        if isinstance(item, RunRequest) or (
+                            isinstance(item, SensorResult) and item.run_requests
+                        ):
                             has_run_request = True
                         yield item
 
@@ -264,7 +266,9 @@ def resilient_sensor(
                 result = fn(*args, **kwargs)
 
                 for item in _dispatch_result(result):
-                    if isinstance(item, RunRequest):
+                    if isinstance(item, RunRequest) or (
+                        isinstance(item, SensorResult) and item.run_requests
+                    ):
                         has_run_request = True
                     yield item
 

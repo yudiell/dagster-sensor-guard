@@ -762,6 +762,27 @@ class TestSensorResult:
         assert isinstance(results[0], SkipReason)
         assert "(1/3)" in results[0].skip_message
 
+    def test_sensor_result_with_run_requests_then_error_no_skip(self, instance):
+        """If a SensorResult with run_requests was yielded before the error,
+        suppress without emitting a SkipReason (same as bare RunRequest)."""
+
+        @sensor(job=_make_job())
+        @resilient_sensor(threshold=5)
+        def partial_sensor(context):
+            yield SensorResult(
+                run_requests=[RunRequest(run_key="sr-1")],
+            )
+            raise ConnectionError("mid-stream failure")
+
+        results, _ = _invoke_sensor(partial_sensor, instance)
+
+        # SensorResult was yielded; no SkipReason should follow.
+        assert len(results) == 1
+        assert isinstance(results[0], SensorResult)
+
+        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        assert state.error_count == 1
+
 
 class TestNoneReturn:
     def test_sensor_returning_none(self, instance):
