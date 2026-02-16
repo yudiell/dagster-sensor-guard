@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, Dict, Optional
 
 from dagster_sensor_guard.state import (
     GuardState,
@@ -14,7 +14,7 @@ from dagster_sensor_guard.state import (
     save_all_key_states,
     should_raise,
 )
-from dagster_sensor_guard.types import ResetStrategy
+from dagster_sensor_guard.types import CursorStorage, ResetStrategy
 
 logger = logging.getLogger("dagster.sensor_guard")
 
@@ -46,7 +46,7 @@ class SensorGuard:
     def __init__(
         self,
         *,
-        storage: object,
+        storage: CursorStorage,
         sensor_name: str,
         threshold: int,
         window_minutes: Optional[int],
@@ -91,7 +91,7 @@ class SensorGuard:
 
         - Success: resets that key's counter.
         - Error below threshold: suppresses, logs, calls on_suppressed_error.
-        - Error at/above threshold: suppresses, collects in breached_keys.
+        - Error above threshold: collects in breached_keys for deferred raise.
         """
         try:
             yield

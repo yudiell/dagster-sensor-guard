@@ -8,7 +8,6 @@ from dagster import (
     AddDynamicPartitionsRequest,
     AssetKey,
     AssetMaterialization,
-    DagsterInstance,
     RunRequest,
     SensorResult,
     SkipReason,
@@ -437,7 +436,6 @@ class TestCursorLeakAfterBreach:
         assert observed_cursors[2] == "20"
         # Tick 4 (after breach): "30" (set by tick 3)
         assert observed_cursors[3] == "30"
-
 
 
 class TestRootCauseNeverRecovers:

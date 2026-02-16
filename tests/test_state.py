@@ -3,8 +3,6 @@
 import time
 from unittest.mock import patch
 
-from dagster import DagsterInstance
-
 from dagster_sensor_guard.state import (
     GuardState,
     apply_reset,
@@ -62,7 +60,6 @@ class TestSaveGuardState:
         save_guard_state(storage, "test", GuardState(error_count=5))
         loaded = load_guard_state(storage, "test")
         assert loaded.error_count == 5
-
 
 
 class TestIncrementError:

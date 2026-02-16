@@ -23,9 +23,68 @@ from dagster_sensor_guard.state import (
     save_guard_state,
     should_raise,
 )
-from dagster_sensor_guard.types import ResetStrategy
+from dagster_sensor_guard.types import CursorStorage, ResetStrategy
 
 logger = logging.getLogger("dagster.sensor_guard")
+
+
+def _dispatch_result(result):
+    """Yield items from a sensor function's return value."""
+    if inspect.isgenerator(result):
+        yield from result
+    elif isinstance(result, SensorResult):
+        yield result
+    elif isinstance(result, (list, tuple)):
+        yield from result
+    elif result is not None:
+        yield result
+
+
+def _handle_sensor_error(
+    exc: Exception,
+    guard_state: GuardState,
+    storage: CursorStorage,
+    sensor_name: str,
+    window_minutes: Optional[int],
+    threshold: int,
+    reset_strategy: ResetStrategy,
+    on_suppressed_error: Optional[Callable[[Exception, int, int], None]],
+    has_run_request: bool,
+) -> tuple[GuardState, bool, Optional[SkipReason]]:
+    """Process a sensor error: increment count, check threshold, persist state.
+
+    Returns (updated_state, should_reraise, skip_reason_or_none).
+    When should_reraise is True, the caller must re-raise the exception
+    inside its own except block to preserve the original traceback.
+    """
+    guard_state = increment_error(guard_state, window_minutes)
+
+    if should_raise(guard_state, threshold):
+        if reset_strategy == ResetStrategy.FULL:
+            save_guard_state(storage, sensor_name, GuardState())
+        else:
+            save_guard_state(storage, sensor_name, guard_state)
+        return guard_state, True, None
+
+    save_guard_state(storage, sensor_name, guard_state)
+
+    if on_suppressed_error is not None:
+        try:
+            on_suppressed_error(exc, guard_state.error_count, threshold)
+        except Exception:
+            logger.warning(
+                "on_suppressed_error callback raised an exception",
+                exc_info=True,
+            )
+
+    skip = None
+    if not has_run_request:
+        skip = SkipReason(
+            f"Suppressed transient error "
+            f"({guard_state.error_count}/{threshold}): {exc}"
+        )
+
+    return guard_state, False, skip
 
 
 def resilient_sensor(
@@ -131,55 +190,22 @@ def resilient_sensor(
                 try:
                     result = fn(context, guard)
 
-                    if inspect.isgenerator(result):
-                        for item in result:
-                            if isinstance(item, RunRequest):
-                                has_run_request = True
-                            yield item
-                    elif isinstance(result, SensorResult):
-                        if result.run_requests:
+                    for item in _dispatch_result(result):
+                        if isinstance(item, RunRequest):
                             has_run_request = True
-                        yield result
-                    elif isinstance(result, (list, tuple)):
-                        for item in result:
-                            if isinstance(item, RunRequest):
-                                has_run_request = True
-                            yield item
-                    elif result is not None:
-                        if isinstance(result, RunRequest):
-                            has_run_request = True
-                        yield result
+                        yield item
 
                 except Exception as exc:
                     # Exception outside guard.track() — sensor-level tracking.
                     guard.save()
-                    guard_state = increment_error(guard_state, window_minutes)
-
-                    if should_raise(guard_state, threshold):
-                        if reset_enum == ResetStrategy.FULL:
-                            save_guard_state(storage, sensor_name, GuardState())
-                        else:
-                            save_guard_state(storage, sensor_name, guard_state)
+                    guard_state, reraise, skip = _handle_sensor_error(
+                        exc, guard_state, storage, sensor_name, window_minutes,
+                        threshold, reset_enum, on_suppressed_error, has_run_request,
+                    )
+                    if reraise:
                         raise
-
-                    save_guard_state(storage, sensor_name, guard_state)
-
-                    if on_suppressed_error is not None:
-                        try:
-                            on_suppressed_error(
-                                exc, guard_state.error_count, threshold
-                            )
-                        except Exception:
-                            logger.warning(
-                                "on_suppressed_error callback raised an exception",
-                                exc_info=True,
-                            )
-
-                    if not has_run_request:
-                        yield SkipReason(
-                            f"Suppressed transient error "
-                            f"({guard_state.error_count}/{threshold}): {exc}"
-                        )
+                    if skip is not None:
+                        yield skip
                     return
 
                 # per_key success path: save per-key state and sensor-level state.
@@ -208,59 +234,20 @@ def resilient_sensor(
             try:
                 result = fn(context)
 
-                if inspect.isgenerator(result):
-                    for item in result:
-                        if isinstance(item, RunRequest):
-                            has_run_request = True
-                        yield item
-                elif isinstance(result, SensorResult):
-                    if result.run_requests:
+                for item in _dispatch_result(result):
+                    if isinstance(item, RunRequest):
                         has_run_request = True
-                    yield result
-                elif isinstance(result, (list, tuple)):
-                    for item in result:
-                        if isinstance(item, RunRequest):
-                            has_run_request = True
-                        yield item
-                elif result is not None:
-                    if isinstance(result, RunRequest):
-                        has_run_request = True
-                    yield result
+                    yield item
 
             except Exception as exc:
-                # --- Error path ---
-                guard_state = increment_error(guard_state, window_minutes)
-
-                if should_raise(guard_state, threshold):
-                    if reset_enum == ResetStrategy.FULL:
-                        # Full reset: give the sensor fresh retries.
-                        save_guard_state(storage, sensor_name, GuardState())
-                    else:
-                        # Decay: preserve the count so subsequent failures
-                        # continue to breach until successes decay it down.
-                        save_guard_state(storage, sensor_name, guard_state)
+                guard_state, reraise, skip = _handle_sensor_error(
+                    exc, guard_state, storage, sensor_name, window_minutes,
+                    threshold, reset_enum, on_suppressed_error, has_run_request,
+                )
+                if reraise:
                     raise
-
-                # Persist the incremented error count.
-                save_guard_state(storage, sensor_name, guard_state)
-
-                # Suppress the error.
-                if on_suppressed_error is not None:
-                    try:
-                        on_suppressed_error(exc, guard_state.error_count, threshold)
-                    except Exception:
-                        logger.warning(
-                            "on_suppressed_error callback raised an exception",
-                            exc_info=True,
-                        )
-
-                # Only yield SkipReason if no RunRequests were yielded this tick
-                # (Dagster forbids mixing SkipReason with RunRequest).
-                if not has_run_request:
-                    yield SkipReason(
-                        f"Suppressed transient error "
-                        f"({guard_state.error_count}/{threshold}): {exc}"
-                    )
+                if skip is not None:
+                    yield skip
                 return
 
             # --- Success path ---

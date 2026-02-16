@@ -1,6 +1,14 @@
 """Enums and configuration types for dagster-sensor-guard."""
 
 from enum import Enum
+from typing import Mapping, Protocol
+
+
+class CursorStorage(Protocol):
+    """Protocol for Dagster's daemon cursor storage."""
+
+    def get_cursor_values(self, keys: set[str]) -> Mapping[str, str]: ...
+    def set_cursor_values(self, values: Mapping[str, str]) -> None: ...
 
 
 class ResetStrategy(str, Enum):
