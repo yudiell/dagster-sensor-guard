@@ -1,7 +1,6 @@
 """Tests for cursor isolation between user data and guard state.
 
-With KVS storage, the user's cursor flows through Dagster natively.
-Guard state lives in daemon_cursor_storage, completely separate.
+Guard state lives in SQLite storage, completely separate from the user's cursor.
 """
 
 import json
@@ -10,15 +9,16 @@ from dagster import SkipReason, build_sensor_context, sensor
 
 from dagster_sensor_guard import resilient_sensor
 from dagster_sensor_guard.state import load_guard_state
+from dagster_sensor_guard.storage import SqliteGuardStorage
 from tests.conftest import make_job as _make_job
 
 _SENSOR_NAME = "test_cursor_sensor"
 
 
 class TestCursorIsolation:
-    def test_user_cursor_preserved_through_success(self, instance):
+    def test_user_cursor_preserved_through_success(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5)
+        @resilient_sensor(threshold=5, db_path=db_path)
         def cursor_sensor(context):
             current = context.cursor or "0"
             new_val = str(int(current) + 1)
@@ -34,14 +34,15 @@ class TestCursorIsolation:
             cursor = context.cursor
 
         assert cursor == "3"
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
-    def test_user_cursor_preserved_through_errors(self, instance):
+    def test_user_cursor_preserved_through_errors(self, instance, db_path):
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5)
+        @resilient_sensor(threshold=5, db_path=db_path)
         def cursor_sensor(context):
             nonlocal tick
             tick += 1
@@ -67,12 +68,13 @@ class TestCursorIsolation:
         # User cursor is untouched — still "offset_100".
         assert context.cursor == "offset_100"
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 1
 
-    def test_sensor_with_no_cursor_usage(self, instance):
+    def test_sensor_with_no_cursor_usage(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def simple_sensor(context):
             yield SkipReason("Nothing to do")
 
@@ -82,15 +84,16 @@ class TestCursorIsolation:
         list(simple_sensor(context))
 
         assert context.cursor is None
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
-    def test_user_reads_own_cursor_not_guard_json(self, instance):
+    def test_user_reads_own_cursor_not_guard_json(self, instance, db_path):
         """User should see their own cursor value, not any guard state."""
         observed_cursors = []
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5)
+        @resilient_sensor(threshold=5, db_path=db_path)
         def cursor_sensor(context):
             observed_cursors.append(context.cursor)
             context.update_cursor("my_value")
@@ -112,11 +115,11 @@ class TestCursorIsolation:
         assert observed_cursors[0] is None
         assert observed_cursors[1] == "my_value"
 
-    def test_user_cursor_json_preserved(self, instance):
+    def test_user_cursor_json_preserved(self, instance, db_path):
         """User cursors that are themselves JSON should roundtrip correctly."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5)
+        @resilient_sensor(threshold=5, db_path=db_path)
         def json_cursor_sensor(context):
             if context.cursor:
                 data = json.loads(context.cursor)

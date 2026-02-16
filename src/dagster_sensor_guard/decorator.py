@@ -1,8 +1,8 @@
 """The @resilient_sensor decorator for Dagster sensors.
 
-Guard state is stored in Dagster's daemon_cursor_storage (KVS), completely
-decoupled from the user's sensor cursor. The user's cursor flows through
-Dagster natively, untouched.
+Guard state is stored in a local SQLite database (via SqliteGuardStorage),
+completely decoupled from the user's sensor cursor. The user's cursor flows
+through Dagster natively, untouched.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from typing import Callable, Optional, Union
 from dagster import RunRequest, SensorDefinition, SensorEvaluationContext, SensorResult, SkipReason
 
 from dagster_sensor_guard.guard import SensorGuard, SensorGuardKeyError
+from dagster_sensor_guard.storage import SqliteGuardStorage
 from dagster_sensor_guard.state import (
     GuardState,
     apply_reset,
@@ -95,6 +96,8 @@ def resilient_sensor(
     decay_amount: int = 1,
     on_suppressed_error: Optional[Callable[[Exception, int, int], None]] = None,
     per_key: bool = False,
+    retention_days: int = 7,
+    db_path: Optional[str] = None,
 ) -> Callable:
     """Decorator that adds error tolerance to a Dagster sensor.
 
@@ -132,6 +135,11 @@ def resilient_sensor(
             suppressed. Signature: (error, current_count, threshold) -> None.
         per_key: When True, a SensorGuard is injected as the second parameter
             for independent per-key failure tracking. Defaults to False.
+        retention_days: Number of days to keep guard state records in the
+            SQLite database. Older records are automatically cleaned up.
+            Defaults to 7.
+        db_path: Explicit path for the SQLite database file. When omitted,
+            falls back to $DAGSTER_HOME/sensor_guard.db or a temp directory.
     """
     if threshold < 1:
         raise ValueError(f"threshold must be >= 1, got {threshold}")
@@ -139,6 +147,8 @@ def resilient_sensor(
         raise ValueError(f"window_minutes must be > 0, got {window_minutes}")
     if decay_amount < 1:
         raise ValueError(f"decay_amount must be >= 1, got {decay_amount}")
+    if retention_days < 1:
+        raise ValueError(f"retention_days must be >= 1, got {retention_days}")
 
     reset_enum = ResetStrategy(reset_strategy)
 
@@ -183,14 +193,20 @@ def resilient_sensor(
         except Exception:
             resolved_annotations = dict(getattr(fn, "__annotations__", {}))
 
+        _storage = None
+
         def wrapped_fn(*args, **kwargs):
+            nonlocal _storage
+            if _storage is None:
+                _storage = SqliteGuardStorage(db_path=db_path, retention_days=retention_days)
+
             # Extract context from positional or keyword args.
             if args:
                 context = args[0]
             else:
                 context = kwargs[context_param_name]
 
-            storage = context.instance.daemon_cursor_storage
+            storage = _storage
             sensor_name = context.sensor_name
 
             # --- Load guard state from KVS ---

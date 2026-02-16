@@ -1,4 +1,4 @@
-"""Tests for state management and KVS storage."""
+"""Tests for state management and storage."""
 
 import time
 from unittest.mock import patch
@@ -27,35 +27,34 @@ class TestKvsKey:
 
 
 class TestLoadGuardState:
-    def test_returns_default_when_no_state(self, instance):
-        state = load_guard_state(instance.daemon_cursor_storage, "nonexistent")
+    def test_returns_default_when_no_state(self, storage):
+        state = load_guard_state(storage, "nonexistent")
         assert state == GuardState()
 
-    def test_roundtrip_with_save(self, instance):
+    def test_roundtrip_with_save(self, storage):
         original = GuardState(error_count=3, first_error_ts=100.0, last_error_ts=200.0)
-        save_guard_state(instance.daemon_cursor_storage, "test_sensor", original)
-        loaded = load_guard_state(instance.daemon_cursor_storage, "test_sensor")
+        save_guard_state(storage, "test_sensor", original)
+        loaded = load_guard_state(storage, "test_sensor")
         assert loaded == original
 
-    def test_returns_default_on_corrupt_data(self, instance):
+    def test_returns_default_on_corrupt_data(self, storage):
         key = kvs_key("corrupt_sensor")
-        instance.daemon_cursor_storage.set_cursor_values({key: "not-valid-json"})
-        state = load_guard_state(instance.daemon_cursor_storage, "corrupt_sensor")
+        storage.set_cursor_values({key: "not-valid-json"})
+        state = load_guard_state(storage, "corrupt_sensor")
         assert state == GuardState()
 
-    def test_sensors_are_isolated(self, instance):
+    def test_sensors_are_isolated(self, storage):
         save_guard_state(
-            instance.daemon_cursor_storage,
+            storage,
             "sensor_a",
             GuardState(error_count=5),
         )
-        state_b = load_guard_state(instance.daemon_cursor_storage, "sensor_b")
+        state_b = load_guard_state(storage, "sensor_b")
         assert state_b == GuardState()
 
 
 class TestSaveGuardState:
-    def test_overwrites_previous_state(self, instance):
-        storage = instance.daemon_cursor_storage
+    def test_overwrites_previous_state(self, storage):
         save_guard_state(storage, "test", GuardState(error_count=1))
         save_guard_state(storage, "test", GuardState(error_count=5))
         loaded = load_guard_state(storage, "test")
@@ -151,45 +150,43 @@ class TestKvsKeysKey:
 
 
 class TestLoadAllKeyStates:
-    def test_empty_returns_empty_dict(self, instance):
-        result = load_all_key_states(instance.daemon_cursor_storage, "nonexistent")
+    def test_empty_returns_empty_dict(self, storage):
+        result = load_all_key_states(storage, "nonexistent")
         assert result == {}
 
-    def test_roundtrip(self, instance):
+    def test_roundtrip(self, storage):
         original = {
             "orders": GuardState(error_count=2, first_error_ts=100.0, last_error_ts=200.0),
             "customers": GuardState(error_count=1, first_error_ts=150.0, last_error_ts=150.0),
         }
-        save_all_key_states(instance.daemon_cursor_storage, "test_sensor", original)
-        loaded = load_all_key_states(instance.daemon_cursor_storage, "test_sensor")
+        save_all_key_states(storage, "test_sensor", original)
+        loaded = load_all_key_states(storage, "test_sensor")
         assert loaded == original
 
-    def test_corrupt_data_returns_empty(self, instance):
+    def test_corrupt_data_returns_empty(self, storage):
         key = kvs_keys_key("corrupt_sensor")
-        instance.daemon_cursor_storage.set_cursor_values({key: "not-valid-json"})
-        result = load_all_key_states(instance.daemon_cursor_storage, "corrupt_sensor")
+        storage.set_cursor_values({key: "not-valid-json"})
+        result = load_all_key_states(storage, "corrupt_sensor")
         assert result == {}
 
-    def test_sensor_isolation(self, instance):
+    def test_sensor_isolation(self, storage):
         save_all_key_states(
-            instance.daemon_cursor_storage,
+            storage,
             "sensor_a",
             {"key1": GuardState(error_count=5)},
         )
-        result = load_all_key_states(instance.daemon_cursor_storage, "sensor_b")
+        result = load_all_key_states(storage, "sensor_b")
         assert result == {}
 
 
 class TestSaveAllKeyStates:
-    def test_overwrites_previous_state(self, instance):
-        storage = instance.daemon_cursor_storage
+    def test_overwrites_previous_state(self, storage):
         save_all_key_states(storage, "test", {"k": GuardState(error_count=1)})
         save_all_key_states(storage, "test", {"k": GuardState(error_count=5)})
         loaded = load_all_key_states(storage, "test")
         assert loaded["k"].error_count == 5
 
-    def test_stores_multiple_keys(self, instance):
-        storage = instance.daemon_cursor_storage
+    def test_stores_multiple_keys(self, storage):
         states = {
             "a": GuardState(error_count=1),
             "b": GuardState(error_count=2),
