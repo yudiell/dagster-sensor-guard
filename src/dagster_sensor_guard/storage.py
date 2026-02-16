@@ -10,6 +10,7 @@ import logging
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 from typing import Mapping, Optional
 
@@ -51,14 +52,16 @@ class SqliteGuardStorage:
         self._db_path = _resolve_db_path(db_path)
         self._retention_days = retention_days
         self._write_count = 0
-        self._conn: Optional[sqlite3.Connection] = None
+        self._local = threading.local()
         self._ensure_table()
 
     def _get_connection(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(self._db_path)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-        return self._conn
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn = conn
+        return conn
 
     def _ensure_table(self) -> None:
         conn = self._get_connection()
@@ -119,7 +122,8 @@ class SqliteGuardStorage:
             )
 
     def close(self) -> None:
-        """Close the database connection."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """Close the database connection for the current thread."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
