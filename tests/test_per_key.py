@@ -335,9 +335,16 @@ class TestPerKeyRunRequests:
         assert results[0].run_key == "healthy_1"
 
         # Tick 2: broken at count 2 (breach) — RunRequest yielded, then error.
+        # Iterate manually so we can inspect items yielded before the raise.
+        context = build_sensor_context(instance=instance, sensor_name=_SENSOR_NAME)
+        gen = multi_sensor(context)
+        collected = []
         with pytest.raises(SensorGuardKeyError):
-            results, _ = _invoke_sensor(multi_sensor, instance)
-            # results collected before exception: the healthy RunRequest was yielded
+            for item in gen:
+                collected.append(item)
+
+        assert len(collected) == 1
+        assert collected[0].run_key == "healthy_2"
 
 
 class TestPerKeyCallback:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import typing
 from functools import update_wrapper
 from typing import Callable, Optional, Union
 
@@ -157,16 +158,38 @@ def resilient_sensor(
                 "Use a synchronous function instead."
             )
 
+        # Inspect the original function's parameter layout at decoration time.
+        orig_sig = inspect.signature(fn)
+        orig_params = list(orig_sig.parameters.values())
+        context_param_name = orig_params[0].name if orig_params else "context"
+
+        guard_param_name = None
         if per_key:
-            sig = inspect.signature(fn)
-            if len(sig.parameters) < 2:
+            if len(orig_params) < 2:
                 raise TypeError(
                     "per_key=True requires the sensor function to accept a "
                     "second parameter for the SensorGuard, e.g.:\n"
                     "    def my_sensor(context, guard): ..."
                 )
+            guard_param_name = orig_params[1].name
 
-        def wrapped_fn(context: SensorEvaluationContext):
+        # Pre-resolve type annotations using the original function's __globals__
+        # so Dagster's typing.get_type_hints() doesn't fail due to __globals__
+        # mismatch (the wrapper lives in decorator.py, not the user's module).
+        try:
+            resolved_annotations = typing.get_type_hints(
+                fn, include_extras=True,
+            )
+        except Exception:
+            resolved_annotations = dict(getattr(fn, "__annotations__", {}))
+
+        def wrapped_fn(*args, **kwargs):
+            # Extract context from positional or keyword args.
+            if args:
+                context = args[0]
+            else:
+                context = kwargs[context_param_name]
+
             storage = context.instance.daemon_cursor_storage
             sensor_name = context.sensor_name
 
@@ -187,11 +210,19 @@ def resilient_sensor(
 
                 has_run_request = False
 
+                # Inject guard into the call alongside any resource kwargs.
+                fn_kwargs = dict(kwargs)
+                if args:
+                    fn_kwargs[context_param_name] = args[0]
+                fn_kwargs[guard_param_name] = guard
+
                 try:
-                    result = fn(context, guard)
+                    result = fn(**fn_kwargs)
 
                     for item in _dispatch_result(result):
-                        if isinstance(item, RunRequest):
+                        if isinstance(item, RunRequest) or (
+                            isinstance(item, SensorResult) and item.run_requests
+                        ):
                             has_run_request = True
                         yield item
 
@@ -228,14 +259,16 @@ def resilient_sensor(
 
                 return
 
-            # --- per_key=False: original code path (unchanged) ---
+            # --- per_key=False: forward all args transparently ---
             has_run_request = False
 
             try:
-                result = fn(context)
+                result = fn(*args, **kwargs)
 
                 for item in _dispatch_result(result):
-                    if isinstance(item, RunRequest):
+                    if isinstance(item, RunRequest) or (
+                        isinstance(item, SensorResult) and item.run_requests
+                    ):
                         has_run_request = True
                     yield item
 
@@ -256,6 +289,21 @@ def resilient_sensor(
 
         # Preserve function metadata for Dagster introspection.
         update_wrapper(wrapped_fn, fn)
+
+        # Override annotations with pre-resolved types so Dagster's
+        # typing.get_type_hints() works despite the __globals__ mismatch.
+        wrapped_fn.__annotations__ = dict(resolved_annotations)
+
+        if per_key:
+            # Hide the guard parameter from Dagster's signature inspection.
+            # Dagster should only see context + resource params; we inject
+            # guard ourselves at call time.
+            visible_params = [
+                p for p in orig_params if p.name != guard_param_name
+            ]
+            wrapped_fn.__signature__ = orig_sig.replace(parameters=visible_params)
+            wrapped_fn.__annotations__.pop(guard_param_name, None)
+
         return wrapped_fn
 
     return decorator
