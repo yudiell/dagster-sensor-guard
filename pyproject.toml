@@ -1,6 +1,6 @@
 [project]
 name = "dagster-sensor-guard"
-version = "0.2.1"
+version = "0.3.0"
 description = "A decorator that adds configurable error tolerance to Dagster sensors, suppressing transient failures and only raising errors after consecutive failure thresholds are breached."
 readme = "README.md"
 license = "MIT"
