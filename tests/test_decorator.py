@@ -17,6 +17,7 @@ from dagster import (
 
 from dagster_sensor_guard import resilient_sensor
 from dagster_sensor_guard.state import GuardState, load_guard_state, save_guard_state
+from dagster_sensor_guard.storage import SqliteGuardStorage
 from tests.conftest import make_job as _make_job
 
 _SENSOR_NAME = "test_sensor"
@@ -35,9 +36,9 @@ def _invoke_sensor(sensor_def, instance, cursor=None, sensor_name=_SENSOR_NAME):
 
 
 class TestCountThreshold:
-    def test_errors_below_threshold_are_suppressed(self, instance):
+    def test_errors_below_threshold_are_suppressed(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
@@ -53,9 +54,9 @@ class TestCountThreshold:
             assert "Suppressed transient error" in results[0].skip_message
             assert f"({i + 1}/3)" in results[0].skip_message
 
-    def test_error_at_threshold_plus_one_raises(self, instance):
+    def test_error_at_threshold_plus_one_raises(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=2)
+        @resilient_sensor(threshold=2, db_path=db_path)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
@@ -75,9 +76,9 @@ class TestCountThreshold:
         with pytest.raises(ConnectionError):
             list(failing_sensor(context))
 
-    def test_error_on_first_tick(self, instance):
+    def test_error_on_first_tick(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def failing_sensor(context):
             raise RuntimeError("boom")
 
@@ -88,9 +89,9 @@ class TestCountThreshold:
 
 
 class TestTimeWindowThreshold:
-    def test_errors_within_window_accumulate(self, instance):
+    def test_errors_within_window_accumulate(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=2, window_minutes=10)
+        @resilient_sensor(threshold=2, window_minutes=10, db_path=db_path)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
@@ -109,11 +110,13 @@ class TestTimeWindowThreshold:
         with pytest.raises(ConnectionError):
             list(failing_sensor(context))
 
-    def test_errors_outside_window_reset_counter(self, instance):
+    def test_errors_outside_window_reset_counter(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=2, window_minutes=10)
+        @resilient_sensor(threshold=2, window_minutes=10, db_path=db_path)
         def failing_sensor(context):
             raise ConnectionError("timeout")
+
+        storage = SqliteGuardStorage(db_path=db_path)
 
         # Simulate 2 errors.
         cursor = None
@@ -124,14 +127,14 @@ class TestTimeWindowThreshold:
             list(failing_sensor(context))
             cursor = context.cursor
 
-        # Manipulate KVS state to make first_error_ts old (outside window).
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        # Manipulate state to make first_error_ts old (outside window).
+        state = load_guard_state(storage, _SENSOR_NAME)
         expired_state = GuardState(
             error_count=state.error_count,
             first_error_ts=1000.0,  # very old
             last_error_ts=state.last_error_ts,
         )
-        save_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME, expired_state)
+        save_guard_state(storage, _SENSOR_NAME, expired_state)
 
         # Next error should be suppressed (counter reset due to window expiry).
         context = build_sensor_context(
@@ -144,11 +147,11 @@ class TestTimeWindowThreshold:
 
 
 class TestFullReset:
-    def test_success_clears_error_count(self, instance):
+    def test_success_clears_error_count(self, instance, db_path):
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5)
+        @resilient_sensor(threshold=5, db_path=db_path)
         def flapping_sensor(context):
             nonlocal tick
             tick += 1
@@ -156,6 +159,7 @@ class TestFullReset:
                 raise ConnectionError("timeout")
             yield SkipReason("OK")
 
+        storage = SqliteGuardStorage(db_path=db_path)
         cursor = None
         # 3 errors.
         for _ in range(3):
@@ -165,7 +169,7 @@ class TestFullReset:
             list(flapping_sensor(context))
             cursor = context.cursor
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 3
 
         # One success.
@@ -174,16 +178,16 @@ class TestFullReset:
         )
         list(flapping_sensor(context))
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
 
 class TestDecayReset:
-    def test_success_decrements_by_decay_amount(self, instance):
+    def test_success_decrements_by_decay_amount(self, instance, db_path):
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5, reset_strategy="decay", decay_amount=2)
+        @resilient_sensor(threshold=5, reset_strategy="decay", decay_amount=2, db_path=db_path)
         def flapping_sensor(context):
             nonlocal tick
             tick += 1
@@ -191,6 +195,7 @@ class TestDecayReset:
                 raise ConnectionError("timeout")
             yield SkipReason("OK")
 
+        storage = SqliteGuardStorage(db_path=db_path)
         cursor = None
         # 4 errors.
         for _ in range(4):
@@ -200,7 +205,7 @@ class TestDecayReset:
             list(flapping_sensor(context))
             cursor = context.cursor
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 4
 
         # One success with decay_amount=2.
@@ -209,17 +214,17 @@ class TestDecayReset:
         )
         list(flapping_sensor(context))
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 2
 
-    def test_decay_accumulates_residual_across_rounds(self, instance):
+    def test_decay_accumulates_residual_across_rounds(self, instance, db_path):
         """Decay only subtracts 1 per success, so residual carries forward."""
         # F, S, F, F, S
         script = [False, True, False, False, True]
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5, reset_strategy="decay", decay_amount=1)
+        @resilient_sensor(threshold=5, reset_strategy="decay", decay_amount=1, db_path=db_path)
         def flapping_sensor(context):
             nonlocal tick
             idx = tick
@@ -228,6 +233,7 @@ class TestDecayReset:
                 raise ConnectionError("timeout")
             yield SkipReason("OK")
 
+        storage = SqliteGuardStorage(db_path=db_path)
         cursor = None
         counts = []
         for _ in script:
@@ -236,12 +242,12 @@ class TestDecayReset:
             )
             list(flapping_sensor(context))
             cursor = context.cursor
-            state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+            state = load_guard_state(storage, _SENSOR_NAME)
             counts.append(state.error_count)
 
         assert counts == [1, 0, 1, 2, 1]
 
-    def test_decay_preserves_count_after_breach(self, instance):
+    def test_decay_preserves_count_after_breach(self, instance, db_path):
         """With decay strategy, breach preserves the count so subsequent
         failures continue to breach until successes decay it down."""
         # F F F F(breach) F(breach) S F(breach) S S
@@ -249,7 +255,7 @@ class TestDecayReset:
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, reset_strategy="decay", decay_amount=1)
+        @resilient_sensor(threshold=3, reset_strategy="decay", decay_amount=1, db_path=db_path)
         def decay_sensor(context):
             nonlocal tick
             idx = tick
@@ -258,6 +264,7 @@ class TestDecayReset:
                 raise ConnectionError("down")
             yield SkipReason("OK")
 
+        storage = SqliteGuardStorage(db_path=db_path)
         cursor = None
         counts = []
         for succeeds in script:
@@ -269,7 +276,7 @@ class TestDecayReset:
             except ConnectionError:
                 pass
             cursor = context.cursor
-            state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+            state = load_guard_state(storage, _SENSOR_NAME)
             counts.append(state.error_count)
 
         # Tick 1: fail → 1 (suppressed)
@@ -285,14 +292,14 @@ class TestDecayReset:
 
 
 class TestRecoveryAfterBreach:
-    def test_success_after_threshold_breach_resets_counter(self, instance):
+    def test_success_after_threshold_breach_resets_counter(self, instance, db_path):
         """After threshold is breached and error raised, a subsequent success
         should reset the counter back to 0 (full reset strategy)."""
         script = [False, False, False, False, True]
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def recovering_sensor(context):
             nonlocal tick
             idx = tick
@@ -331,16 +338,17 @@ class TestRecoveryAfterBreach:
         assert isinstance(results[0], SkipReason)
         assert results[0].skip_message == "OK"
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
-    def test_error_after_recovery_starts_fresh_count(self, instance):
+    def test_error_after_recovery_starts_fresh_count(self, instance, db_path):
         """After recovering from a breach, new errors should start from (1/N)."""
         script = [False, False, False, False, True, False]
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def recovering_sensor(context):
             nonlocal tick
             idx = tick
@@ -381,19 +389,20 @@ class TestRecoveryAfterBreach:
         assert isinstance(results[0], SkipReason)
         assert "(1/3)" in results[0].skip_message
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 1
 
 
 class TestCursorLeakAfterBreach:
-    def test_user_sees_own_cursor_not_json_after_breach(self, instance):
+    def test_user_sees_own_cursor_not_json_after_breach(self, instance, db_path):
         """After a breach, the user's sensor should see their cursor value,
         not any guard state data."""
         observed_cursors = []
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=2)
+        @resilient_sensor(threshold=2, db_path=db_path)
         def cursor_sensor(context):
             nonlocal tick
             observed_cursors.append(context.cursor)
@@ -439,16 +448,16 @@ class TestCursorLeakAfterBreach:
 
 
 class TestRootCauseNeverRecovers:
-    """With KVS storage, the 'never recovers' bug is eliminated because
+    """With SQLite storage, the 'never recovers' bug is eliminated because
     guard state persists independently of Dagster's cursor."""
 
-    def test_kvs_persists_independently_of_tick_outcome(self, instance):
-        """Guard state in KVS persists even when Dagster drops the cursor
+    def test_kvs_persists_independently_of_tick_outcome(self, instance, db_path):
+        """Guard state in SQLite persists even when Dagster drops the cursor
         on a failed tick. This eliminates the cycling bug."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=2)
+        @resilient_sensor(threshold=2, db_path=db_path)
         def cycling_sensor(context):
             nonlocal tick
             tick += 1
@@ -456,6 +465,7 @@ class TestRootCauseNeverRecovers:
                 raise ConnectionError("down")
             yield SkipReason("recovered")
 
+        storage = SqliteGuardStorage(db_path=db_path)
         cursor = None
 
         # Ticks 1-2: suppressed errors.
@@ -466,15 +476,15 @@ class TestRootCauseNeverRecovers:
             list(cycling_sensor(ctx))
             cursor = ctx.cursor
 
-        # Tick 3: breach — even if Dagster drops cursor, KVS has reset state.
+        # Tick 3: breach — even if Dagster drops cursor, storage has reset state.
         ctx = build_sensor_context(
             cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
         )
         with pytest.raises(ConnectionError):
             list(cycling_sensor(ctx))
 
-        # KVS has reset state regardless of cursor.
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        # Storage has reset state regardless of cursor.
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
         # Tick 4: still broken — fresh suppression starts.
@@ -492,15 +502,15 @@ class TestRootCauseNeverRecovers:
         results = list(cycling_sensor(ctx))
         assert results[0].skip_message == "recovered"
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
-    def test_fresh_retries_after_breach(self, instance):
-        """After breach, the reset state in KVS gives fresh retries."""
+    def test_fresh_retries_after_breach(self, instance, db_path):
+        """After breach, the reset state gives fresh retries."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=2)
+        @resilient_sensor(threshold=2, db_path=db_path)
         def retry_sensor(context):
             nonlocal tick
             tick += 1
@@ -508,6 +518,7 @@ class TestRootCauseNeverRecovers:
                 raise ConnectionError("down")
             yield SkipReason("recovered")
 
+        storage = SqliteGuardStorage(db_path=db_path)
         cursor = None
 
         # Ticks 1-2: suppressed (1/2, 2/2).
@@ -518,14 +529,14 @@ class TestRootCauseNeverRecovers:
             list(retry_sensor(ctx))
             cursor = ctx.cursor
 
-        # Tick 3: breach. KVS resets.
+        # Tick 3: breach. Storage resets.
         ctx = build_sensor_context(
             cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
         )
         with pytest.raises(ConnectionError):
             list(retry_sensor(ctx))
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0  # Reset, not stuck at 3
 
         # Ticks 4-5: fresh retries — suppressed as (1/2, 2/2).
@@ -547,14 +558,15 @@ class TestRootCauseNeverRecovers:
 
 
 class TestBreachResetsForRecovery:
-    def test_breach_persists_reset_state(self, instance):
-        """When the threshold is breached, KVS should have error_count=0."""
+    def test_breach_persists_reset_state(self, instance, db_path):
+        """When the threshold is breached, storage should have error_count=0."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=2)
+        @resilient_sensor(threshold=2, db_path=db_path)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
+        storage = SqliteGuardStorage(db_path=db_path)
         cursor = None
 
         # 2 suppressed errors.
@@ -565,26 +577,26 @@ class TestBreachResetsForRecovery:
             list(failing_sensor(context))
             cursor = context.cursor
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 2
 
-        # 3rd error breaches — KVS should have reset state.
+        # 3rd error breaches — storage should have reset state.
         context = build_sensor_context(
             cursor=cursor, instance=instance, sensor_name=_SENSOR_NAME,
         )
         with pytest.raises(ConnectionError):
             list(failing_sensor(context))
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
 
 class TestCallback:
-    def test_on_suppressed_error_called(self, instance):
+    def test_on_suppressed_error_called(self, instance, db_path):
         callback = MagicMock()
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, on_suppressed_error=callback)
+        @resilient_sensor(threshold=3, on_suppressed_error=callback, db_path=db_path)
         def failing_sensor(context):
             raise ValueError("bad value")
 
@@ -596,11 +608,11 @@ class TestCallback:
         assert args[1] == 1  # error count
         assert args[2] == 3  # threshold
 
-    def test_callback_not_called_when_threshold_breached(self, instance):
+    def test_callback_not_called_when_threshold_breached(self, instance, db_path):
         callback = MagicMock()
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=1, on_suppressed_error=callback)
+        @resilient_sensor(threshold=1, on_suppressed_error=callback, db_path=db_path)
         def failing_sensor(context):
             raise ValueError("bad value")
 
@@ -621,18 +633,20 @@ class TestCallback:
 
 
 class TestSensorIsolation:
-    def test_error_counts_are_independent_across_sensors(self, instance):
-        """Each decorated sensor tracks its own error count in KVS."""
+    def test_error_counts_are_independent_across_sensors(self, instance, db_path):
+        """Each decorated sensor tracks its own error count."""
 
         @sensor(job=_make_job(), name="sensor_a")
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def sensor_a(context):
             raise ConnectionError("sensor A down")
 
         @sensor(job=_make_job(), name="sensor_b")
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def sensor_b(context):
             raise ConnectionError("sensor B down")
+
+        storage = SqliteGuardStorage(db_path=db_path)
 
         # Fail sensor_a 3 times.
         for _ in range(3):
@@ -641,11 +655,11 @@ class TestSensorIsolation:
             )
             list(sensor_a(ctx))
 
-        state_a = load_guard_state(instance.daemon_cursor_storage, "sensor_a")
+        state_a = load_guard_state(storage, "sensor_a")
         assert state_a.error_count == 3
 
         # sensor_b should still be at 0.
-        state_b = load_guard_state(instance.daemon_cursor_storage, "sensor_b")
+        state_b = load_guard_state(storage, "sensor_b")
         assert state_b.error_count == 0
 
         # Fail sensor_b once.
@@ -654,20 +668,20 @@ class TestSensorIsolation:
         )
         list(sensor_b(ctx))
 
-        state_b = load_guard_state(instance.daemon_cursor_storage, "sensor_b")
+        state_b = load_guard_state(storage, "sensor_b")
         assert state_b.error_count == 1
 
         # sensor_a is still at 3.
-        state_a = load_guard_state(instance.daemon_cursor_storage, "sensor_a")
+        state_a = load_guard_state(storage, "sensor_a")
         assert state_a.error_count == 3
 
 
 class TestMultipleRunRequests:
-    def test_run_requests_forwarded_then_error_suppressed_no_skip(self, instance):
+    def test_run_requests_forwarded_then_error_suppressed_no_skip(self, instance, db_path):
         """If RunRequests were yielded before the error, suppress without SkipReason."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5)
+        @resilient_sensor(threshold=5, db_path=db_path)
         def partial_sensor(context):
             yield RunRequest(run_key="a")
             yield RunRequest(run_key="b")
@@ -679,12 +693,13 @@ class TestMultipleRunRequests:
         assert len(results) == 2
         assert all(isinstance(r, RunRequest) for r in results)
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 1
 
-    def test_multiple_run_requests_success(self, instance):
+    def test_multiple_run_requests_success(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5)
+        @resilient_sensor(threshold=5, db_path=db_path)
         def multi_sensor(context):
             yield RunRequest(run_key="a")
             yield RunRequest(run_key="b")
@@ -696,11 +711,11 @@ class TestMultipleRunRequests:
 
 
 class TestSensorResult:
-    def test_sensor_result_yielded_with_contents(self, instance):
+    def test_sensor_result_yielded_with_contents(self, instance, db_path):
         """SensorResult is yielded as-is for Dagster to process."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def result_sensor(context):
             return SensorResult(
                 run_requests=[RunRequest(run_key="sr-1"), RunRequest(run_key="sr-2")],
@@ -716,14 +731,15 @@ class TestSensorResult:
         # SensorResult passes through natively — cursor is preserved.
         assert results[0].cursor == "new_cursor"
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
-    def test_sensor_result_skip_reason_preserved(self, instance):
+    def test_sensor_result_skip_reason_preserved(self, instance, db_path):
         """SensorResult with skip_reason is yielded intact."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def result_sensor(context):
             return SensorResult(skip_reason=SkipReason("nothing to do"))
 
@@ -732,15 +748,16 @@ class TestSensorResult:
         assert isinstance(results[0], SensorResult)
         assert results[0].skip_reason.skip_message == "nothing to do"
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
-    def test_sensor_result_error_suppressed(self, instance):
+    def test_sensor_result_error_suppressed(self, instance, db_path):
         """Error after a SensorResult tick should be suppressed."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def result_sensor(context):
             nonlocal tick
             tick += 1
@@ -762,12 +779,12 @@ class TestSensorResult:
         assert isinstance(results[0], SkipReason)
         assert "(1/3)" in results[0].skip_message
 
-    def test_sensor_result_with_run_requests_then_error_no_skip(self, instance):
+    def test_sensor_result_with_run_requests_then_error_no_skip(self, instance, db_path):
         """If a SensorResult with run_requests was yielded before the error,
         suppress without emitting a SkipReason (same as bare RunRequest)."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5)
+        @resilient_sensor(threshold=5, db_path=db_path)
         def partial_sensor(context):
             yield SensorResult(
                 run_requests=[RunRequest(run_key="sr-1")],
@@ -780,37 +797,40 @@ class TestSensorResult:
         assert len(results) == 1
         assert isinstance(results[0], SensorResult)
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 1
 
 
 class TestNoneReturn:
-    def test_sensor_returning_none(self, instance):
+    def test_sensor_returning_none(self, instance, db_path):
         """A sensor that returns None should succeed cleanly."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def none_sensor(context):
             pass
 
         results, _ = _invoke_sensor(none_sensor, instance)
         assert len(results) == 0
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
-    def test_none_return_resets_error_count(self, instance):
+    def test_none_return_resets_error_count(self, instance, db_path):
         """A None-returning success should still reset the error counter."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5)
+        @resilient_sensor(threshold=5, db_path=db_path)
         def none_sensor(context):
             nonlocal tick
             tick += 1
             if tick <= 2:
                 raise ConnectionError("timeout")
 
+        storage = SqliteGuardStorage(db_path=db_path)
         cursor = None
         # 2 errors.
         for _ in range(2):
@@ -820,7 +840,7 @@ class TestNoneReturn:
             list(none_sensor(context))
             cursor = context.cursor
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 2
 
         # Tick 3: success (None return), resets counter.
@@ -829,7 +849,7 @@ class TestNoneReturn:
         )
         list(none_sensor(context))
 
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 0
 
 
@@ -854,11 +874,15 @@ class TestInputValidation:
         with pytest.raises(ValueError, match="decay_amount must be >= 1"):
             resilient_sensor(decay_amount=0)
 
+    def test_retention_days_zero_raises(self):
+        with pytest.raises(ValueError, match="retention_days must be >= 1"):
+            resilient_sensor(retention_days=0)
+
 
 class TestSensorResultFields:
-    def test_dynamic_partitions_requests_preserved(self, instance):
+    def test_dynamic_partitions_requests_preserved(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def dp_sensor(context):
             return SensorResult(
                 run_requests=[RunRequest(run_key="dp-1")],
@@ -878,9 +902,9 @@ class TestSensorResultFields:
         assert len(sr.dynamic_partitions_requests) == 1
         assert sr.dynamic_partitions_requests[0].partition_keys == ["2024-01-01"]
 
-    def test_asset_events_preserved(self, instance):
+    def test_asset_events_preserved(self, instance, db_path):
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3)
+        @resilient_sensor(threshold=3, db_path=db_path)
         def asset_sensor(context):
             return SensorResult(
                 asset_events=[
@@ -897,27 +921,28 @@ class TestSensorResultFields:
 
 
 class TestCallbackExceptionHandling:
-    def test_broken_callback_does_not_crash_sensor(self, instance):
+    def test_broken_callback_does_not_crash_sensor(self, instance, db_path):
         def bad_callback(error, count, threshold):
             raise RuntimeError("callback exploded")
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, on_suppressed_error=bad_callback)
+        @resilient_sensor(threshold=3, on_suppressed_error=bad_callback, db_path=db_path)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 
         results, _ = _invoke_sensor(failing_sensor, instance)
         assert len(results) == 1
         assert isinstance(results[0], SkipReason)
-        state = load_guard_state(instance.daemon_cursor_storage, _SENSOR_NAME)
+        storage = SqliteGuardStorage(db_path=db_path)
+        state = load_guard_state(storage, _SENSOR_NAME)
         assert state.error_count == 1
 
-    def test_broken_callback_logs_warning(self, instance, caplog):
+    def test_broken_callback_logs_warning(self, instance, db_path, caplog):
         def bad_callback(error, count, threshold):
             raise RuntimeError("callback exploded")
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, on_suppressed_error=bad_callback)
+        @resilient_sensor(threshold=3, on_suppressed_error=bad_callback, db_path=db_path)
         def failing_sensor(context):
             raise ConnectionError("timeout")
 

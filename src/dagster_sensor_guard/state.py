@@ -1,8 +1,8 @@
-"""Error state tracking and KVS storage for dagster-sensor-guard.
+"""Error state tracking and storage for dagster-sensor-guard.
 
-Guard state is stored in Dagster's daemon_cursor_storage (a SQL-backed
-key-value store), completely decoupled from the user's sensor cursor.
-The user's cursor flows through Dagster natively, untouched.
+Guard state is stored in a local SQLite database (via SqliteGuardStorage),
+completely decoupled from the user's sensor cursor. The user's cursor
+flows through Dagster natively, untouched.
 """
 
 from __future__ import annotations

@@ -19,6 +19,7 @@ from dagster_sensor_guard.state import (
     load_guard_state,
     save_all_key_states,
 )
+from dagster_sensor_guard.storage import SqliteGuardStorage
 from tests.conftest import make_job as _make_job
 
 _SENSOR_NAME = "test_per_key_sensor"
@@ -33,11 +34,11 @@ def _invoke_sensor(sensor_def, instance, cursor=None, sensor_name=_SENSOR_NAME):
 
 
 class TestPerKeyBasicBehavior:
-    def test_errors_below_threshold_suppressed_per_key(self, instance):
+    def test_errors_below_threshold_suppressed_per_key(self, instance, db_path):
         """Errors below the threshold for a key are suppressed; loop continues."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             for table in ["orders", "customers", "inventory"]:
                 with guard.track(table):
@@ -48,12 +49,12 @@ class TestPerKeyBasicBehavior:
         # No SensorGuardKeyError raised; sensor completes normally.
         assert len(results) == 0  # no RunRequests, no SkipReason from per_key path
 
-    def test_breached_keys_raise_after_all_processed(self, instance):
+    def test_breached_keys_raise_after_all_processed(self, instance, db_path):
         """Keys that breach threshold raise SensorGuardKeyError after all keys are processed."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=1, per_key=True)
+        @resilient_sensor(threshold=1, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -74,11 +75,11 @@ class TestPerKeyBasicBehavior:
         assert "orders" in err.breached_keys
         assert "customers" in err.breached_keys
 
-    def test_mixed_success_and_failure(self, instance):
+    def test_mixed_success_and_failure(self, instance, db_path):
         """Some keys succeed while others fail; only failed keys accumulate errors."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             for table in ["orders", "customers", "inventory"]:
                 with guard.track(table):
@@ -87,21 +88,20 @@ class TestPerKeyBasicBehavior:
 
         _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        storage = SqliteGuardStorage(db_path=db_path)
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states.get("orders", GuardState()).error_count == 0
         assert key_states["customers"].error_count == 1
         assert key_states.get("inventory", GuardState()).error_count == 0
 
 
 class TestPerKeyIsolation:
-    def test_each_key_failure_independent(self, instance):
+    def test_each_key_failure_independent(self, instance, db_path):
         """Each key's failures are independent of other keys."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -115,23 +115,22 @@ class TestPerKeyIsolation:
         for _ in range(3):
             _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        storage = SqliteGuardStorage(db_path=db_path)
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states["orders"].error_count == 3
         assert key_states.get("customers", GuardState()).error_count == 0
 
-    def test_different_sensors_per_key_isolated(self, instance):
+    def test_different_sensors_per_key_isolated(self, instance, db_path):
         """Per-key state for different sensors is isolated."""
 
         @sensor(job=_make_job(), name="sensor_x")
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def sensor_x(context, guard):
             with guard.track("key_a"):
                 raise ConnectionError("down")
 
         @sensor(job=_make_job(), name="sensor_y")
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def sensor_y(context, guard):
             with guard.track("key_a"):
                 pass  # success
@@ -142,20 +141,21 @@ class TestPerKeyIsolation:
         ctx = build_sensor_context(instance=instance, sensor_name="sensor_y")
         list(sensor_y(ctx))
 
-        x_states = load_all_key_states(instance.daemon_cursor_storage, "sensor_x")
-        y_states = load_all_key_states(instance.daemon_cursor_storage, "sensor_y")
+        storage = SqliteGuardStorage(db_path=db_path)
+        x_states = load_all_key_states(storage, "sensor_x")
+        y_states = load_all_key_states(storage, "sensor_y")
 
         assert x_states["key_a"].error_count == 1
         assert y_states.get("key_a", GuardState()).error_count == 0
 
 
 class TestPerKeyReset:
-    def test_success_resets_key_full_strategy(self, instance):
+    def test_success_resets_key_full_strategy(self, instance, db_path):
         """Success on a key resets that key's counter with FULL strategy."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5, per_key=True)
+        @resilient_sensor(threshold=5, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -163,30 +163,28 @@ class TestPerKeyReset:
                 if tick <= 2:
                     raise ConnectionError("orders down")
 
+        storage = SqliteGuardStorage(db_path=db_path)
+
         # 2 failures.
         for _ in range(2):
             _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states["orders"].error_count == 2
 
         # 1 success — resets to 0.
         _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states.get("orders", GuardState()).error_count == 0
 
-    def test_success_decays_key_decay_strategy(self, instance):
+    def test_success_decays_key_decay_strategy(self, instance, db_path):
         """Success on a key decays that key's counter with DECAY strategy."""
         tick = 0
 
         @sensor(job=_make_job())
         @resilient_sensor(
-            threshold=5, per_key=True, reset_strategy="decay", decay_amount=1
+            threshold=5, per_key=True, reset_strategy="decay", decay_amount=1, db_path=db_path
         )
         def multi_sensor(context, guard):
             nonlocal tick
@@ -195,29 +193,27 @@ class TestPerKeyReset:
                 if tick <= 3:
                     raise ConnectionError("orders down")
 
+        storage = SqliteGuardStorage(db_path=db_path)
+
         # 3 failures.
         for _ in range(3):
             _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states["orders"].error_count == 3
 
         # 1 success — decays by 1.
         _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states["orders"].error_count == 2
 
-    def test_success_resets_only_that_key(self, instance):
+    def test_success_resets_only_that_key(self, instance, db_path):
         """Success on one key does not affect other keys."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5, per_key=True)
+        @resilient_sensor(threshold=5, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -229,33 +225,31 @@ class TestPerKeyReset:
                     if table == "customers" and tick <= 2:
                         raise ConnectionError("customers down")
 
+        storage = SqliteGuardStorage(db_path=db_path)
+
         # 2 ticks: both fail.
         for _ in range(2):
             _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states["orders"].error_count == 2
         assert key_states["customers"].error_count == 2
 
         # Tick 3: orders fails, customers succeeds.
         _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states["orders"].error_count == 3
         assert key_states.get("customers", GuardState()).error_count == 0  # reset
 
 
 class TestPerKeyStatePersistence:
-    def test_per_key_state_persists_across_ticks(self, instance):
+    def test_per_key_state_persists_across_ticks(self, instance, db_path):
         """Per-key state persists across separate sensor invocations."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5, per_key=True)
+        @resilient_sensor(threshold=5, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -266,41 +260,38 @@ class TestPerKeyStatePersistence:
         for _ in range(3):
             _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        storage = SqliteGuardStorage(db_path=db_path)
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states["orders"].error_count == 3
 
-    def test_sensor_level_state_independent_of_per_key(self, instance):
+    def test_sensor_level_state_independent_of_per_key(self, instance, db_path):
         """Sensor-level state is independent of per-key state."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=5, per_key=True)
+        @resilient_sensor(threshold=5, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             with guard.track("orders"):
                 raise ConnectionError("orders down")
 
         _invoke_sensor(multi_sensor, instance)
 
+        storage = SqliteGuardStorage(db_path=db_path)
+
         # Per-key state has the error.
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states["orders"].error_count == 1
 
         # Sensor-level state should be clean (no unhandled exception).
-        sensor_state = load_guard_state(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        sensor_state = load_guard_state(storage, _SENSOR_NAME)
         assert sensor_state.error_count == 0
 
 
 class TestPerKeyRunRequests:
-    def test_run_requests_from_healthy_keys_yielded(self, instance):
+    def test_run_requests_from_healthy_keys_yielded(self, instance, db_path):
         """RunRequests from healthy keys are yielded even when other keys fail."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             for table in ["orders", "customers", "inventory"]:
                 with guard.track(table):
@@ -315,12 +306,12 @@ class TestPerKeyRunRequests:
         assert "inventory_run" in run_keys
         assert "customers_run" not in run_keys
 
-    def test_run_requests_yielded_before_breach_error(self, instance):
+    def test_run_requests_yielded_before_breach_error(self, instance, db_path):
         """RunRequests are yielded before SensorGuardKeyError is raised."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=1, per_key=True)
+        @resilient_sensor(threshold=1, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -348,12 +339,12 @@ class TestPerKeyRunRequests:
 
 
 class TestPerKeyCallback:
-    def test_on_suppressed_error_called_for_per_key(self, instance):
+    def test_on_suppressed_error_called_for_per_key(self, instance, db_path):
         """on_suppressed_error is called for per-key suppressed errors."""
         callback = MagicMock()
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True, on_suppressed_error=callback)
+        @resilient_sensor(threshold=3, per_key=True, on_suppressed_error=callback, db_path=db_path)
         def multi_sensor(context, guard):
             with guard.track("orders"):
                 raise ConnectionError("orders down")
@@ -366,13 +357,13 @@ class TestPerKeyCallback:
         assert args[1] == 1  # error count
         assert args[2] == 3  # threshold
 
-    def test_callback_called_per_key_not_for_breach(self, instance):
+    def test_callback_called_per_key_not_for_breach(self, instance, db_path):
         """Callback is called for suppressed errors, not for breached keys."""
         callback = MagicMock()
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=1, per_key=True, on_suppressed_error=callback)
+        @resilient_sensor(threshold=1, per_key=True, on_suppressed_error=callback, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -388,12 +379,12 @@ class TestPerKeyCallback:
             _invoke_sensor(multi_sensor, instance)
         assert callback.call_count == 1
 
-    def test_callback_for_multiple_keys(self, instance):
+    def test_callback_for_multiple_keys(self, instance, db_path):
         """Callback is called once per suppressed key error."""
         callback = MagicMock()
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True, on_suppressed_error=callback)
+        @resilient_sensor(threshold=3, per_key=True, on_suppressed_error=callback, db_path=db_path)
         def multi_sensor(context, guard):
             for table in ["orders", "customers", "inventory"]:
                 with guard.track(table):
@@ -404,11 +395,11 @@ class TestPerKeyCallback:
 
 
 class TestPerKeySensorLevelFallback:
-    def test_exception_outside_track_uses_sensor_level(self, instance):
+    def test_exception_outside_track_uses_sensor_level(self, instance, db_path):
         """Exceptions outside guard.track() are handled by sensor-level tracking."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             raise RuntimeError("unexpected top-level error")
 
@@ -417,16 +408,15 @@ class TestPerKeySensorLevelFallback:
         assert isinstance(results[0], SkipReason)
         assert "(1/3)" in results[0].skip_message
 
-        sensor_state = load_guard_state(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        storage = SqliteGuardStorage(db_path=db_path)
+        sensor_state = load_guard_state(storage, _SENSOR_NAME)
         assert sensor_state.error_count == 1
 
-    def test_sensor_level_breach_raises_original_error(self, instance):
+    def test_sensor_level_breach_raises_original_error(self, instance, db_path):
         """Sensor-level threshold breach raises the original error, not SensorGuardKeyError."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=1, per_key=True)
+        @resilient_sensor(threshold=1, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             raise RuntimeError("top-level boom")
 
@@ -437,11 +427,11 @@ class TestPerKeySensorLevelFallback:
         with pytest.raises(RuntimeError, match="top-level boom"):
             _invoke_sensor(multi_sensor, instance)
 
-    def test_per_key_state_saved_on_sensor_level_error(self, instance):
+    def test_per_key_state_saved_on_sensor_level_error(self, instance, db_path):
         """Per-key state from before the top-level error is still saved."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             with guard.track("orders"):
                 raise ConnectionError("orders down")
@@ -450,9 +440,8 @@ class TestPerKeySensorLevelFallback:
 
         _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        storage = SqliteGuardStorage(db_path=db_path)
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         assert key_states["orders"].error_count == 1
 
 
@@ -486,12 +475,12 @@ class TestPerKeyValidation:
 
 
 class TestPerKeyCombinedError:
-    def test_sensor_guard_key_error_contains_all_breached(self, instance):
+    def test_sensor_guard_key_error_contains_all_breached(self, instance, db_path):
         """SensorGuardKeyError contains all breached keys and their exceptions."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=1, per_key=True)
+        @resilient_sensor(threshold=1, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -519,12 +508,12 @@ class TestPerKeyCombinedError:
         assert "orders" in str(err)
         assert "inventory" in str(err)
 
-    def test_sensor_guard_key_error_preserves_original_exceptions(self, instance):
+    def test_sensor_guard_key_error_preserves_original_exceptions(self, instance, db_path):
         """Breached keys map to their original exceptions."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=1, per_key=True)
+        @resilient_sensor(threshold=1, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -546,13 +535,13 @@ class TestPerKeyCombinedError:
 
 
 class TestPerKeyWindow:
-    def test_window_applies_independently_per_key(self, instance):
+    def test_window_applies_independently_per_key(self, instance, db_path):
         """window_minutes applies independently to each key."""
         now = time.time()
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=2, per_key=True, window_minutes=10)
+        @resilient_sensor(threshold=2, per_key=True, window_minutes=10, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1
@@ -563,26 +552,22 @@ class TestPerKeyWindow:
         # Tick 1: both keys fail once.
         _invoke_sensor(multi_sensor, instance)
 
+        storage = SqliteGuardStorage(db_path=db_path)
+
         # Expire the "orders" key's first_error_ts to be outside the window.
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         orders_state = key_states["orders"]
         key_states["orders"] = GuardState(
             error_count=orders_state.error_count,
             first_error_ts=now - 700,  # outside 10-minute window
             last_error_ts=orders_state.last_error_ts,
         )
-        save_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME, key_states
-        )
+        save_all_key_states(storage, _SENSOR_NAME, key_states)
 
         # Tick 2: orders resets (window expired), customers continues (count 2).
         _invoke_sensor(multi_sensor, instance)
 
-        key_states = load_all_key_states(
-            instance.daemon_cursor_storage, _SENSOR_NAME
-        )
+        key_states = load_all_key_states(storage, _SENSOR_NAME)
         # orders: window expired → reset → count 1 (fresh chain).
         assert key_states["orders"].error_count == 1
         # customers: window still active → count 2.
@@ -590,11 +575,11 @@ class TestPerKeyWindow:
 
 
 class TestPerKeyLogging:
-    def test_suppressed_keys_logged_at_info(self, instance, caplog):
+    def test_suppressed_keys_logged_at_info(self, instance, db_path, caplog):
         """Suppressed per-key errors are logged at INFO level."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             for table in ["orders", "customers"]:
                 with guard.track(table):
@@ -607,11 +592,11 @@ class TestPerKeyLogging:
         assert any("key 'orders': error suppressed (1/3)" in m for m in info_messages)
         assert any("key 'customers': error suppressed (1/3)" in m for m in info_messages)
 
-    def test_success_keys_logged_at_info(self, instance, caplog):
+    def test_success_keys_logged_at_info(self, instance, db_path, caplog):
         """Successful per-key outcomes are logged at INFO level."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             with guard.track("orders"):
                 pass  # success
@@ -622,11 +607,11 @@ class TestPerKeyLogging:
         info_messages = [r.message for r in caplog.records if r.levelno == logging.INFO]
         assert any("key 'orders': ok" in m for m in info_messages)
 
-    def test_tick_summary_logged_at_warning(self, instance, caplog):
+    def test_tick_summary_logged_at_warning(self, instance, db_path, caplog):
         """Tick summary is logged at WARNING level."""
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=3, per_key=True)
+        @resilient_sensor(threshold=3, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             for table in ["orders", "customers", "inventory"]:
                 with guard.track(table):
@@ -639,12 +624,12 @@ class TestPerKeyLogging:
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any("tick summary: 2 ok, 1 suppressed, 0 breached" in m for m in warning_messages)
 
-    def test_tick_summary_includes_breached_keys(self, instance, caplog):
+    def test_tick_summary_includes_breached_keys(self, instance, db_path, caplog):
         """Tick summary lists breached key names when present."""
         tick = 0
 
         @sensor(job=_make_job())
-        @resilient_sensor(threshold=1, per_key=True)
+        @resilient_sensor(threshold=1, per_key=True, db_path=db_path)
         def multi_sensor(context, guard):
             nonlocal tick
             tick += 1

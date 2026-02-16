@@ -2,6 +2,7 @@
 
 from dagster_sensor_guard.decorator import resilient_sensor
 from dagster_sensor_guard.guard import SensorGuard, SensorGuardKeyError
+from dagster_sensor_guard.storage import SqliteGuardStorage
 from dagster_sensor_guard.types import ResetStrategy
 
 __all__ = [
@@ -9,4 +10,5 @@ __all__ = [
     "ResetStrategy",
     "SensorGuard",
     "SensorGuardKeyError",
+    "SqliteGuardStorage",
 ]
