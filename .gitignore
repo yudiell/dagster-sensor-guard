@@ -213,3 +213,4 @@ PLAN.md
 .python-version
 *py.typed
 CODE-REVIEW.md
+dagster_sensor_guard_*.md
